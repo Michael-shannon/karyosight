@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: "Shannon"
+    given-names: "Michael"
+    email: "m.j.shannon@pm.me"
+repository-code: "https://github.com/michael-shannon/karyosight"
+title: "karyosight: ploidy prediction"
+license: "GPL-3.0"
