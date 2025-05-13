@@ -1,8 +1,17 @@
 # config.py
 from pathlib import Path
 
-RAW_DIR         = Path(r"D:\LUNGBUDMASTERTEST_2") / "analyze"
-STITCHED_DIR    = Path(r"D:\LUNGBUDMASTERTEST_2") / "stitched"
+MASTER = Path(r"D:\LUNGBUDMASTERTEST_4")  # master directory
+
+# RAW_DIR         = Path(r"D:\LUNGBUDMASTERTEST_3") / "analyze"
+# STITCHED_DIR    = Path(r"D:\LUNGBUDMASTERTEST_3") / "stitched"
+# CROPPED_DIR = Path(r"D:\LUNGBUDMASTERTEST_3") / "cropped"
+
+RAW_DIR         = MASTER / "analyze"
+STITCHED_DIR    = MASTER / "stitched"
+CROPPED_DIR = MASTER / "cropped"
+
+
 CONDITION_PREF  = "Condition_"
 MULTIVIEW_CMD   = "multiview-stitcher"      # your CLI tool
 BATCH_GRID_SHAPE= (2, 2)                    # split each full-grid into 2×2 sub-grids
