@@ -37,409 +37,26 @@ import cupy
 import math
 from pathlib import Path
 
-# class Stitcher:
-#     """
-#     A class to process tiled TIFF datasets: extract metadata, convert to Zarr, stitch, and export.
-#     """
-#     def __init__(self, master_folder):
-#         """
-#         Initialize with a master directory containing multiple 'Condition_' folders.
 
-#         Parameters:
-#           - master_folder: Path or str to a directory containing condition subfolders
-#         """
-#         self.master_folder = Path(master_folder)
-#         self.conditions = sorted([
-#             p for p in self.master_folder.iterdir()
-#             if p.is_dir() and p.name.startswith("Condition_")
-#         ])
+############
 
-#     # def extract_metadata(self, condition):
-#     #     """
-#     #     Extract tiling metadata for a given condition folder.
+# PyImageJ
 
-#     #     Returns a dict with keys: overlap, region_origin, region_size,
-#     #     grid_size, tile_shape, tiles
-#     #     """
-#     #     cond_folder = Path(condition)
-#     #     if not cond_folder.is_dir():
-#     #         cond_folder = self.master_folder / condition
-#     #     info_file = next(cond_folder.glob("*forVSIimages.omp2info"))
-#     #     tif_folder = cond_folder
+import imagej
+# import scyjava as sj
 
-#     #     def strip_ns(tag): return tag.split("}")[-1]
-#     #     tree = ET.parse(info_file)
-#     #     root = tree.getroot()
+import scyjava
 
-#     #     overlap_pct = float(next(e for e in root.iter() if strip_ns(e.tag) == "overlap").text)
-#     #     overlap = {"x": overlap_pct/100, "y": overlap_pct/100}
+# Tell the JVM to open java.lang to unnamed modules (required on newer Java)
+scyjava.config.add_option("--add-opens=java.base/java.lang=ALL-UNNAMED")
 
-#     #     coords = next(e for e in root.iter() if strip_ns(e.tag) == "coordinates")
-#     #     region_origin = {"x": float(coords.attrib["x"]), "y": float(coords.attrib["y"]) }
-#     #     region_size   = {"width": float(coords.attrib["width"]), "height": float(coords.attrib["height"]) }
+# Initialize once (in headless or interactive mode as you prefer)
+# IJ = imagej.init('sc.fiji:fiji', mode='headless')
+# BF = sj.jimport('loci.plugins.BF')
+# ImporterOptions = sj.jimport('loci.plugins.in.ImporterOptions')
 
-#     #     num_x = int(next(e for e in root.iter() if strip_ns(e.tag) == "numOfXAreas").text)
-#     #     num_y = int(next(e for e in root.iter() if strip_ns(e.tag) == "numOfYAreas").text)
+###############
 
-#     #     tif_stems = {p.stem for p in tif_folder.glob("*.tif")}
-#     #     tiles = []
-#     #     for area in (e for e in root.iter() if strip_ns(e.tag) == "area"):
-#     #         img  = next(e for e in area if strip_ns(e.tag) == "image").text
-#     #         stem = Path(img).stem
-#     #         if stem in tif_stems:
-#     #             xidx = int(next(e for e in area if strip_ns(e.tag) == "xIndex").text)
-#     #             yidx = int(next(e for e in area if strip_ns(e.tag) == "yIndex").text)
-#     #             tiles.append({"filename": f"{stem}.tif", "x_index": xidx, "y_index": yidx})
-#     #     tiles.sort(key=lambda t: (t["y_index"], t["x_index"]))
-
-#     #     first_tif = tif_folder / tiles[0]["filename"]
-#     #     arr = tifffile.imread(first_tif)
-#     #     if arr.ndim == 4:
-#     #         z, c, y, x = arr.shape
-#     #     else:
-#     #         z, y, x = arr.shape
-#     #     tile_shape = {"z": z, "y": y, "x": x}
-
-
-
-
-#     #     return {
-#     #         "overlap": overlap,
-#     #         "region_origin": region_origin,
-#     #         "region_size": region_size,
-#     #         "grid_size": {"cols": num_x, "rows": num_y},
-#     #         "tile_shape": tile_shape,
-#     #         "tiles": tiles
-#     #     }
-
-#     @staticmethod
-#     def _estimate_max_subgrid(cmd_folder,
-#                               safety_fraction: float,
-#                               overhead_factor: float) -> int:
-#         """
-#         Inspect one TIFF in `cmd_folder` and
-#         return the largest square side (in tiles)
-#         that fits into RAM.
-#         """
-#         # 1) pick a sample TIFF
-#         sample = next(Path(cmd_folder).glob("*.tif"), None)
-#         if sample is None:
-#             raise RuntimeError(f"No TIFFs in {cmd_folder}")
-#         arr = tifffile.imread(sample)
-#         # unpack dims
-#         if arr.ndim == 4:
-#             z, c, y, x = arr.shape
-#         elif arr.ndim == 3:
-#             z, y, x = arr.shape; c = 1
-#         else:
-#             raise RuntimeError(f"Unrecognized shape {arr.shape}")
-#         bytes_per_tile = z * y * x * c * arr.dtype.itemsize
-#         avail = psutil.virtual_memory().available * safety_fraction
-#         eff = bytes_per_tile * overhead_factor
-#         max_tiles = int(avail // eff)
-#         side = int(np.floor(np.sqrt(max_tiles)))
-#         return max(1, side)
-
-#     def extract_metadata(self, condition):
-#         """
-#         Extract tiling metadata for a given condition folder.
-
-#         Returns a dict with keys: overlap, region_origin, region_size,
-#         grid_size, tile_shape, tiles
-#         """
-#         cond_folder = Path(condition)
-#         if not cond_folder.is_dir():
-#             cond_folder = self.master_folder / condition
-#         info_file = next(cond_folder.glob("*forVSIimages.omp2info"))
-#         tif_folder = cond_folder
-
-#         def strip_ns(tag): return tag.split("}")[-1]
-#         tree = ET.parse(info_file)
-#         root = tree.getroot()
-
-#         overlap_pct = float(next(e for e in root.iter() if strip_ns(e.tag) == "overlap").text)
-#         overlap = {"x": overlap_pct/100, "y": overlap_pct/100}
-
-#         coords = next(e for e in root.iter() if strip_ns(e.tag) == "coordinates")
-#         region_origin = {"x": float(coords.attrib["x"]), "y": float(coords.attrib["y"]) }
-#         region_size   = {"width": float(coords.attrib["width"]), "height": float(coords.attrib["height"]) }
-
-#         num_x = int(next(e for e in root.iter() if strip_ns(e.tag) == "numOfXAreas").text)
-#         num_y = int(next(e for e in root.iter() if strip_ns(e.tag) == "numOfYAreas").text)
-
-#         tif_stems = {p.stem for p in tif_folder.glob("*.tif")}
-#         tiles = []
-#         for area in (e for e in root.iter() if strip_ns(e.tag) == "area"):
-#             img  = next(e for e in area if strip_ns(e.tag) == "image").text
-#             stem = Path(img).stem
-#             if stem in tif_stems:
-#                 xidx = int(next(e for e in area if strip_ns(e.tag) == "xIndex").text)
-#                 yidx = int(next(e for e in area if strip_ns(e.tag) == "yIndex").text)
-#                 tiles.append({"filename": f"{stem}.tif", "x_index": xidx, "y_index": yidx})
-#         tiles.sort(key=lambda t: (t["y_index"], t["x_index"]))
-
-#         first_tif = tif_folder / tiles[0]["filename"]
-#         arr = tifffile.imread(first_tif)
-#         if arr.ndim == 4:
-#             z, c, y, x = arr.shape
-#         else:
-#             z, y, x = arr.shape
-#         tile_shape = {"z": z, "y": y, "x": x}
-#         # a
-#         meta = {
-#             "overlap": { "x": overlap_pct/100, "y": overlap_pct/100 },
-#             "region_origin": region_origin,
-#             "region_size": region_size,
-#             "grid_size": {"cols": num_x, "rows": num_y},
-#             "tile_shape": tile_shape,
-#             "tiles": tiles
-#         }
-
-#         # build static sub-grid definitions
-#         cols, rows = num_x, num_y
-#         bw, bh = cfg.BATCH_GRID_SHAPE
-#         tile_overlap = cfg.BATCH_TILE_OVERLAP
-
-#         subgrids = []
-#         nx = math.ceil(cols/bw)
-#         ny = math.ceil(rows/bh)
-#         for sgx in range(nx):
-#             for sgy in range(ny):
-#                 x0, y0 = sgx*bw,      sgy*bh
-#                 x1, y1 = min(cols,x0+bw), min(rows,y0+bh)
-#                 xo, yo = max(0, x0-tile_overlap), max(0, y0-tile_overlap)
-#                 xe, ye = min(cols, x1+tile_overlap), min(rows, y1+tile_overlap)
-
-#                 tiles_in_batch = [
-#                     t for t in tiles
-#                     if xo <= t["x_index"] < xe
-#                     and yo <= t["y_index"] < ye
-#                 ]
-#                 tiles_in_batch.sort(key=lambda t:(t["y_index"],t["x_index"]))
-#                 subgrids.append({
-#                     "id": f"{sgx}_{sgy}",
-#                     "x_range": (x0, x1),
-#                     "y_range": (y0, y1),
-#                     "tiles": tiles_in_batch
-#                 })
-
-#         meta["subgrids"] = subgrids
-#         meta["num_subgrids"] = {"cols": nx, "rows": ny}
-
-#         return meta
-
-#     @staticmethod
-#     def load_maxproj_images(folder):
-#         """
-#         Generator yielding (filename, max_projection) for each TIFF in `folder`.
-#         """
-#         folder = Path(folder)
-#         tif_paths = sorted(folder.glob("*.tif")) + sorted(folder.glob("*.tiff"))
-#         for path in tif_paths:
-#             stack = tifffile.imread(path)
-#             if stack.ndim == 4:
-#                 channel0 = stack[:, 0, ...]
-#             elif stack.ndim == 3:
-#                 channel0 = stack
-#             else:
-#                 raise ValueError(f"Unexpected image dims {stack.shape} for {path.name}")
-#             yield path.name, np.max(channel0, axis=0)
-
-#     @staticmethod
-#     def get_tile_grid_position_from_tile_index(tile_index, num_cols, num_rows=None):
-#         """
-#         Convert flat tile_index to grid coords (z,y,x).
-#         """
-#         return {'z': 0, 'y': tile_index // num_cols, 'x': tile_index % num_cols}
-
-#     @staticmethod
-#     def convert_tiles_to_zarr(tiles, tif_folder, scale, translations,
-#                               overwrite=True, use_gpu=False):
-#         """
-#         Convert tile TIFFs to OME-Zarr using same basename.
-#         If use_gpu=True, wrap arrays in CuPy via Dask.
-#         """
-#         tif_folder = Path(tif_folder)
-#         zarr_folder = tif_folder
-#         zarr_paths, msims = [], []
-
-#         for idx, tile in enumerate(tiles):
-#             tif_path = tif_folder / tile['filename']
-#             arr = tifffile.imread(tif_path)
-#             if arr.ndim == 3:
-#                 arr = arr[None, ...]
-#             elif arr.ndim == 4:
-#                 arr = arr.transpose(1, 0, 2, 3)
-#             else:
-#                 raise ValueError(f"Unexpected arr shape {arr.shape} for {tif_path.name}")
-
-#             if use_gpu:
-#                 import cupy
-#                 darr = da.from_array(arr, chunks="auto", asarray=cupy.asarray)
-#             else:
-#                 darr = da.from_array(arr, chunks="auto")
-
-#             sim = si_utils.get_sim_from_array(
-#                 darr, dims=["c","z","y","x"],
-#                 scale=scale,
-#                 translation=translations[idx],
-#                 transform_key=io.METADATA_TRANSFORM_KEY
-#             )
-
-#             stem = Path(tile['filename']).stem
-#             zarr_path = zarr_folder / f"{stem}.zarr"
-#             ngff_utils.write_sim_to_ome_zarr(sim, str(zarr_path), overwrite=overwrite)
-
-#             sim2 = ngff_utils.read_sim_from_ome_zarr(str(zarr_path))
-#             msim = msi_utils.get_msim_from_sim(sim2)
-
-#             zarr_paths.append(str(zarr_path))
-#             msims.append(msim)
-#                     # Option A: persist (turns each D
-#         return zarr_paths, msims
-
-#     def compute_translations(self, meta, scale):
-#         tiles, overlap, ts = meta['tiles'], meta['overlap'], meta['tile_shape']
-#         transs = []
-#         for t in tiles:
-#             tx = t['x_index']*(1-overlap['x'])*ts['x']*scale['x']
-#             ty = t['y_index']*(1-overlap['y'])*ts['y']*scale['y']
-#             transs.append({'x':tx,'y':ty,'z':0.0})
-#         return transs
-    
-#     def split_tiles_into_batches(self,
-#                                  meta: dict,
-#                                  batch_shape: tuple[int,int],
-#                                  overlap_tiles: int = 1) -> list[dict]:
-#         """
-#         Breaks the full meta['tiles'] (flattened, row-major) into
-#         sub-grid “batches” of size batch_shape, stepped so that
-#         each window overlaps its neighbors by overlap_tiles.
-
-#         Returns a list of dicts, each with:
-#           - 'x_start','y_start': the top-left tile coords of the window
-#           - 'tiles':       the list of tile-dicts in that window
-#         """
-#         cols = meta['grid_size']['cols']
-#         rows = meta['grid_size']['rows']
-#         tiles = meta['tiles']
-
-#         batch_w, batch_h = batch_shape
-#         step_x = batch_w - overlap_tiles
-#         step_y = batch_h - overlap_tiles
-
-#         batches = []
-#         seen = set()
-#         for y0 in range(0, rows, step_y):
-#             for x0 in range(0, cols, step_x):
-#                 # clamp window to grid boundaries
-#                 x_start = min(x0, cols - batch_w)
-#                 y_start = min(y0, rows - batch_h)
-
-#                 key = (x_start, y_start)
-#                 if key in seen:
-#                     continue
-#                 seen.add(key)
-
-#                 # collect only tiles in this sub-grid
-#                 sub = [
-#                     t for t in tiles
-#                     if (x_start <= t['x_index'] < x_start + batch_w)
-#                     and (y_start <= t['y_index'] < y_start + batch_h)
-#                 ]
-#                 sub.sort(key=lambda t: (t['y_index'], t['x_index']))
-#                 batches.append({
-#                     'x_start': x_start,
-#                     'y_start': y_start,
-#                     'tiles': sub
-#                 })
-#         return batches
-
-
-#     def perform_channel_alignment(self, msims, do_align, tile_ix=0):
-#         key = 'affine_metadata'
-#         if do_align:
-#             key = 'affine_metadata_ch_reg'
-#             # channel registration logic here
-#         return msims, key
-
-#     # def stitch_tiles(self, msims, transform_key):
-#     #     new_key = 'affine_registered'
-#     #     with dask.diagnostics.ProgressBar():
-#     #         params = registration.register(
-#     #             msims,
-#     #             registration_binning={'y':1,'x':1},
-#     #             reg_channel_index=0,
-#     #             transform_key=transform_key,
-#     #             new_transform_key=new_key,
-#     #             pre_registration_pruning_method="keep_axis_aligned"
-#     #         )
-#     #     return params, new_key
-    
-#     def stitch_tiles(self, msims, transform_key, scheduler='threads'): # carrot changed for latest
-#         """
-#         Run tile-to-tile affine registration, store under 'affine_registered'.
-#         Use local threads scheduler by default to avoid sending large graphs.
-#         """
-#         new_key = 'affine_registered'
-#         with dask.diagnostics.ProgressBar():
-#             params = registration.register(
-#                 msims,
-#                 registration_binning={'y':1,'x':1},
-#                 reg_channel_index=0,
-#                 transform_key=transform_key,
-#                 new_transform_key=new_key,
-#                 pre_registration_pruning_method="keep_axis_aligned"
-#             )
-#         return params, new_key    
-
-#     def fuse_and_export(self, msims, out_folder, export_tiff=False):
-#         out = Path(out_folder)
-#         out.mkdir(exist_ok=True, parents=True)
-#         name = out.name
-#         zarr_out = out / f"{name}.zarr"
-#         fused = fusion.fuse([
-#             msi_utils.get_sim_from_msim(m) for m in msims
-#         ], transform_key='affine_registered', output_chunksize=256)
-#         with dask.diagnostics.ProgressBar():
-#             ngff_utils.write_sim_to_ome_zarr(fused, str(zarr_out), overwrite=True)
-#         if export_tiff:
-#             tif_out = out / f"{name}.tif"
-#             with dask.diagnostics.ProgressBar():
-#                 io.save_sim_as_tif(str(tif_out), fused)
-
-
-# ############### EXTRA ############################# Cilantro. Added just before carrot
-
-#     @staticmethod
-#     def _load_msim_from_zarr(zarr_path: str):
-#         """Read a SIM from disk and wrap it as a multiscale image."""
-#         sim = ngff_utils.read_sim_from_ome_zarr(zarr_path)
-#         return msi_utils.get_msim_from_sim(sim)
-
-#     def stitch_from_zarr(self, zarr_paths, transform_key):
-#         """
-#         Instead of taking MSIM objects, take the list of tile .zarr paths (small!)
-#         and do the registration entirely on the workers.
-#         """
-#         # 1) Build a list of *delayed* MSIMs so only the zarr_paths list crosses the wire
-#         msims_delayed = [
-#             delayed(self._load_msim_from_zarr)(str(p))
-#             for p in zarr_paths
-#         ]
-
-#         # 2) Perform registration on those delayed MSIMs
-#         new_key = 'affine_registered'
-#         with dask.diagnostics.ProgressBar():
-#             params = registration.register(
-#                 msims_delayed,
-#                 registration_binning={'y':1,'x':1},
-#                 reg_channel_index=0,
-#                 transform_key=transform_key,
-#                 new_transform_key=new_key,
-#                 pre_registration_pruning_method="keep_axis_aligned",
-#             )
-#         return params, new_key
 
 # ################# CARROT ##############################
 
@@ -460,63 +77,7 @@ class Stitcher:
             if p.is_dir() and p.name.startswith("Condition_")
         ])
 
-    # def extract_metadata(self, condition):
-    #     """
-    #     Extract tiling metadata for a given condition folder.
-
-    #     Returns a dict with keys: overlap, region_origin, region_size,
-    #     grid_size, tile_shape, tiles
-    #     """
-    #     cond_folder = Path(condition)
-    #     if not cond_folder.is_dir():
-    #         cond_folder = self.master_folder / condition
-    #     info_file = next(cond_folder.glob("*forVSIimages.omp2info"))
-    #     tif_folder = cond_folder
-
-    #     def strip_ns(tag): return tag.split("}")[-1]
-    #     tree = ET.parse(info_file)
-    #     root = tree.getroot()
-
-    #     overlap_pct = float(next(e for e in root.iter() if strip_ns(e.tag) == "overlap").text)
-    #     overlap = {"x": overlap_pct/100, "y": overlap_pct/100}
-
-    #     coords = next(e for e in root.iter() if strip_ns(e.tag) == "coordinates")
-    #     region_origin = {"x": float(coords.attrib["x"]), "y": float(coords.attrib["y"]) }
-    #     region_size   = {"width": float(coords.attrib["width"]), "height": float(coords.attrib["height"]) }
-
-    #     num_x = int(next(e for e in root.iter() if strip_ns(e.tag) == "numOfXAreas").text)
-    #     num_y = int(next(e for e in root.iter() if strip_ns(e.tag) == "numOfYAreas").text)
-
-    #     tif_stems = {p.stem for p in tif_folder.glob("*.tif")}
-    #     tiles = []
-    #     for area in (e for e in root.iter() if strip_ns(e.tag) == "area"):
-    #         img  = next(e for e in area if strip_ns(e.tag) == "image").text
-    #         stem = Path(img).stem
-    #         if stem in tif_stems:
-    #             xidx = int(next(e for e in area if strip_ns(e.tag) == "xIndex").text)
-    #             yidx = int(next(e for e in area if strip_ns(e.tag) == "yIndex").text)
-    #             tiles.append({"filename": f"{stem}.tif", "x_index": xidx, "y_index": yidx})
-    #     tiles.sort(key=lambda t: (t["y_index"], t["x_index"]))
-
-    #     first_tif = tif_folder / tiles[0]["filename"]
-    #     arr = tifffile.imread(first_tif)
-    #     if arr.ndim == 4:
-    #         z, c, y, x = arr.shape
-    #     else:
-    #         z, y, x = arr.shape
-    #     tile_shape = {"z": z, "y": y, "x": x}
-
-
-
-
-    #     return {
-    #         "overlap": overlap,
-    #         "region_origin": region_origin,
-    #         "region_size": region_size,
-    #         "grid_size": {"cols": num_x, "rows": num_y},
-    #         "tile_shape": tile_shape,
-    #         "tiles": tiles
-    #     }
+  
 
     @staticmethod
     def _estimate_max_subgrid(cmd_folder,
@@ -545,6 +106,10 @@ class Stitcher:
         max_tiles = int(avail // eff)
         side = int(np.floor(np.sqrt(max_tiles)))
         return max(1, side)
+    
+
+
+
 
     def extract_metadata(self, condition):
         """
@@ -573,15 +138,48 @@ class Stitcher:
         num_x = int(next(e for e in root.iter() if strip_ns(e.tag) == "numOfXAreas").text)
         num_y = int(next(e for e in root.iter() if strip_ns(e.tag) == "numOfYAreas").text)
 
-        tif_stems = {p.stem for p in tif_folder.glob("*.tif")}
+        # tif_stems = {p.stem for p in tif_folder.glob("*.tif")} # REMOVED 5-29-2025
+
+        # support TIFF, TIFFF, and OIR
+        img_paths = (
+            sorted(tif_folder.glob("*.tif")) +
+            sorted(tif_folder.glob("*.tiff")) +
+            sorted(tif_folder.glob("*.oir"))
+        )
+        if not img_paths:
+            raise RuntimeError(f"No .tif/.tiff/.oir files found in {tif_folder}")
+        # map stem → actual filename
+        stem_to_file = {p.stem: p.name for p in img_paths}
+        img_stems = set(stem_to_file)
+ #carrot cilantro
+
+        # tiles = []
         tiles = []
         for area in (e for e in root.iter() if strip_ns(e.tag) == "area"):
-            img  = next(e for e in area if strip_ns(e.tag) == "image").text
-            stem = Path(img).stem
-            if stem in tif_stems:
+            img_name = next(e for e in area if strip_ns(e.tag) == "image").text
+            stem     = Path(img_name).stem
+            if stem in img_stems:
                 xidx = int(next(e for e in area if strip_ns(e.tag) == "xIndex").text)
                 yidx = int(next(e for e in area if strip_ns(e.tag) == "yIndex").text)
-                tiles.append({"filename": f"{stem}.tif", "x_index": xidx, "y_index": yidx})
+                tiles.append({
+                    "filename": stem_to_file[stem],
+                    "x_index":  xidx,
+                    "y_index":  yidx
+                })
+
+        if not tiles:
+            raise RuntimeError(
+                f"No image files (tif/tiff/oir) matched the XML entries in {cond_folder}"
+            )
+        # for area in (e for e in root.iter() if strip_ns(e.tag) == "area"):
+        #     img  = next(e for e in area if strip_ns(e.tag) == "image").text
+        #     stem = Path(img).stem
+        #     if stem in tif_stems:
+        #         xidx = int(next(e for e in area if strip_ns(e.tag) == "xIndex").text)
+        #         yidx = int(next(e for e in area if strip_ns(e.tag) == "yIndex").text)
+        #         tiles.append({"filename": f"{stem}.tif", "x_index": xidx, "y_index": yidx})
+
+
         tiles.sort(key=lambda t: (t["y_index"], t["x_index"]))
 
 
@@ -597,14 +195,47 @@ class Stitcher:
             print(f"⚠️ {len(missing_on_disk)} XML entries missing .tif on disk:",
                 missing_on_disk)
 
-        first_tif = tif_folder / tiles[0]["filename"]
-        arr = tifffile.imread(first_tif)
+        # first_tif = tif_folder / tiles[0]["filename"]
+        # arr = tifffile.imread(first_tif)
+        
+        # if arr.ndim == 4:
+        #     z, c, y, x = arr.shape
+        # else:
+        #     z, y, x = arr.shape
+
+        # tile_shape = {"z": z, "y": y, "x": x}
+
+        # pick your very first “tile” (which might be .tif or .oir)
+        first_path = tif_folder / tiles[0]["filename"]
+        suffix = first_path.suffix.lower()
+
+        if suffix in (".tif", ".tiff"):
+            arr = tifffile.imread(first_path)
+
+        elif suffix == ".oir":
+            # lazy‐load the Bio‐Formats JVM
+            IJ, BF, ImporterOptions = _get_bioformats()
+            opts = ImporterOptions()
+            opts.setOpenAllSeries(True)
+            opts.setVirtual(True)
+            opts.setId(str(first_path))
+            imps = BF.openImagePlus(opts)       # Java ImagePlus[]
+            # grab the first series and convert to numpy
+            jarr = IJ.py.from_java(imps[0])
+            arr = jarr  # this is now a numpy array; may be 2D, 3D, or 4D
+
+        else:
+            raise RuntimeError(f"Unrecognized file extension {suffix!r} for {first_path}")
+
+        # now infer tile_shape exactly as before
         if arr.ndim == 4:
             z, c, y, x = arr.shape
+        elif arr.ndim == 3:
+            z, y, x = arr.shape;  c = 1
         else:
-            z, y, x = arr.shape
-
+            raise RuntimeError(f"Cannot parse shape {arr.shape} from first tile")
         tile_shape = {"z": z, "y": y, "x": x}
+
 
 #################
         if cfg.BATCH_GRID_SHAPE is None:
@@ -683,10 +314,6 @@ class Stitcher:
         }
         return meta
 
-
-
-
-
 # ######################
 #         # a
 #         meta = {
@@ -731,22 +358,131 @@ class Stitcher:
 
 #         return meta
 
+############## VERY IMPORTANT: THIS BELOW IS THE ONE THAT DEFINITELY  WORKS 5-29-2025 ################################
+    # @staticmethod
+    # def load_maxproj_images(folder):
+    #     """
+    #     Generator yielding (filename, max_projection) for each TIFF in `folder`.
+    #     """
+    #     folder = Path(folder)
+    #     tif_paths = sorted(folder.glob("*.tif")) + sorted(folder.glob("*.tiff"))
+    #     for path in tif_paths:
+    #         stack = tifffile.imread(path)
+    #         if stack.ndim == 4:
+    #             channel0 = stack[:, 0, ...]
+    #         elif stack.ndim == 3:
+    #             channel0 = stack
+    #         else:
+    #             raise ValueError(f"Unexpected image dims {stack.shape} for {path.name}")
+    #         yield path.name, np.max(channel0, axis=0)
+
+    ############## VERY IMPORTANT: THIS ABOVE IS THE ONE THAT DEFINITELY  WORKS 5-29-2025 ################################
+
+    # @staticmethod
+    # def load_maxproj_images(folder):
+    #     """
+    #     Generator yielding (name, max_projection) for each TIFF or OIR in `folder`,
+    #     depending on cfg.IMAGE_LOADER.
+    #     """
+    #     folder = Path(folder)
+    #     loader = cfg.IMAGE_LOADER.lower()
+
+    #     # decide which extensions to scan
+    #     tifs = []
+    #     oirs = []
+    #     if loader in ("tif", "both"):
+    #         tifs = sorted(folder.glob("*.tif")) + sorted(folder.glob("*.tiff"))
+    #     if loader in ("oir", "both"):
+    #         oirs = sorted(folder.glob("*.oir"))
+
+    #     # 1) Yield TIFF max-projections
+    #     for path in tifs:
+    #         stack = tifffile.imread(path)
+    #         # channel0 extraction as before
+    #         if stack.ndim == 4:
+    #             channel0 = stack[:, 0, ...]
+    #         elif stack.ndim == 3:
+    #             channel0 = stack
+    #         else:
+    #             raise ValueError(f"Unexpected dims {stack.shape} in {path.name}")
+    #         name = path.name
+    #         yield name, np.max(channel0, axis=0)
+
+    #     # 2) If configured, open OIR series via Bio-Formats
+    #     if oirs:
+    #         IJ, BF, ImporterOptions = _get_bioformats()
+    #         for path in oirs:
+    #             opts = ImporterOptions()
+    #             opts.setOpenAllSeries(True)
+    #             opts.setVirtual(True)
+    #             opts.setId(str(path))
+    #             imps = BF.openImagePlus(opts)    # Java ImagePlus[]
+    #             for idx, imp in enumerate(imps):
+    #                 # convert to numpy
+    #                 arr = IJ.py.from_java(imp)
+    #                 # extract channel0 exactly as above
+    #                 if arr.ndim == 4:
+    #                     channel0 = arr[:, 0, ...]
+    #                 elif arr.ndim == 3:
+    #                     channel0 = arr
+    #                 elif arr.ndim == 2:
+    #                     channel0 = arr[None, ...]
+    #                 else:
+    #                     raise ValueError(f"Unexpected BF array shape {arr.shape}")
+    #                 name = f"{path.stem}_series{idx}{path.suffix}"
+    #                 yield name, np.max(channel0, axis=0)
+#### THIS ABOVE IS FIRST TRY FOR OIR READING ############
+
     @staticmethod
     def load_maxproj_images(folder):
         """
-        Generator yielding (filename, max_projection) for each TIFF in `folder`.
+        Generator yielding (name, max_projection) for each TIFF/.oir in `folder`,
+        according to cfg.IMAGE_LOADER (“tif”, “oir”, or “both”).
         """
         folder = Path(folder)
-        tif_paths = sorted(folder.glob("*.tif")) + sorted(folder.glob("*.tiff"))
-        for path in tif_paths:
-            stack = tifffile.imread(path)
-            if stack.ndim == 4:
-                channel0 = stack[:, 0, ...]
-            elif stack.ndim == 3:
-                channel0 = stack
+        mode = cfg.IMAGE_LOADER.lower()
+
+        tifs = []
+        oirs = []
+        if mode in ("tif", "both"):
+            tifs = sorted(folder.glob("*.tif")) + sorted(folder.glob("*.tiff"))
+        if mode in ("oir", "both"):
+            oirs = sorted(folder.glob("*.oir"))
+
+        # TIFF pipeline
+        for path in tifs:
+            arr = tifffile.imread(path)
+            if arr.ndim == 4:
+                channel0 = arr[:, 0, ...]
+            elif arr.ndim == 3:
+                channel0 = arr
             else:
-                raise ValueError(f"Unexpected image dims {stack.shape} for {path.name}")
+                raise ValueError(f"Unexpected TIFF dims {arr.shape} in {path.name}")
             yield path.name, np.max(channel0, axis=0)
+
+        # Bio-Formats OIR pipeline
+        if oirs:
+            IJ, BF, ImporterOptions = _get_bioformats()
+            for path in oirs:
+                opts = ImporterOptions()
+                opts.setOpenAllSeries(True)
+                opts.setVirtual(True)
+                opts.setId(str(path))
+                imps = BF.openImagePlus(opts)
+                for idx, imp in enumerate(imps):
+                    jarr = IJ.py.from_java(imp)
+                    if jarr.ndim == 4:
+                        channel0 = jarr[:, 0, ...]
+                    elif jarr.ndim == 3:
+                        channel0 = jarr
+                    elif jarr.ndim == 2:
+                        channel0 = jarr[None, ...]
+                    else:
+                        raise ValueError(f"Unexpected BF array {jarr.shape}")
+                    name = f"{path.stem}_series{idx}{path.suffix}"
+                    yield name, np.max(channel0, axis=0)
+
+
 
     @staticmethod
     def get_tile_grid_position_from_tile_index(tile_index, num_cols, num_rows=None):
@@ -776,46 +512,7 @@ class Stitcher:
         zarr_folder = Path(tif_folder) #cilantro
         print(f"→ [Subgrid {subgrid_id}] writing {len(tiles)} tiles to {zarr_folder}") #cilantro
         zarr_paths, msims = [], []
-################### OLD down ######################################
-        # for idx, tile in enumerate(tiles):
-        #     tif_path = tif_folder / tile['filename']
-        #     arr = tifffile.imread(tif_path)
-        #     if arr.ndim == 3:
-        #         arr = arr[None, ...]
-        #     elif arr.ndim == 4:
-        #         arr = arr.transpose(1, 0, 2, 3)
-        #     else:
-        #         raise ValueError(f"Unexpected arr shape {arr.shape} for {tif_path.name}")
 
-        #     if use_gpu:
-                
-        #         darr = da.from_array(arr, chunks="auto", asarray=cupy.asarray)
-        #     else:
-        #         darr = da.from_array(arr, chunks="auto")
-
-        #     sim = si_utils.get_sim_from_array(
-        #         darr, dims=["c","z","y","x"],
-        #         scale=scale,
-        #         translation=translations[idx],
-        #         transform_key=io.METADATA_TRANSFORM_KEY
-        #     )
-
-        #     stem = Path(tile['filename']).stem
-
-        #     name = f"{stem}"
-        #     if subgrid_id:
-        #         name += f"_{subgrid_id}"
-        #     zarr_path = zarr_folder / f"{name}.zarr" #new
-        #     # zarr_path = zarr_folder / f"{stem}.zarr" #old 
-
-        #     ngff_utils.write_sim_to_ome_zarr(sim, str(zarr_path), overwrite=overwrite)
-
-        #     sim2 = ngff_utils.read_sim_from_ome_zarr(str(zarr_path))
-        #     msim = msi_utils.get_msim_from_sim(sim2)
-
-        #     zarr_paths.append(str(zarr_path))
-        #     msims.append(msim)
-###################### OLD UP ########################################    
         for idx, tile in enumerate(tiles):
             xi, yi = tile["x_index"], tile["y_index"]
 
@@ -969,20 +666,204 @@ class Stitcher:
             )
         return params, new_key    
 
-    def fuse_and_export(self, msims, out_folder, export_tiff=False):
+    def fuse_and_export(self, msims, out_folder, export_tiff=False, crop_z_black_frames=False, z_crop_threshold=0.01):
+        """
+        Fuse multiple MSIMs and export to zarr/tiff.
+        
+        Parameters
+        ----------
+        msims : list
+            List of multiscale image models
+        out_folder : str or Path
+            Output directory
+        export_tiff : bool, optional
+            Whether to also export as TIFF
+        crop_z_black_frames : bool, optional
+            Whether to crop black z-frames after fusion (default: False)
+        z_crop_threshold : float, optional
+            Threshold for detecting "empty" z-slices (default: 0.01)
+            Z-slices with max intensity below this fraction of global max are considered empty
+        """
         out = Path(out_folder)
         out.mkdir(exist_ok=True, parents=True)
         name = out.name
         zarr_out = out / f"{name}.zarr"
+        
+        # Perform fusion
         fused = fusion.fuse([
             msi_utils.get_sim_from_msim(m) for m in msims
         ], transform_key='affine_registered', output_chunksize=256)
+        
+        # Optionally crop black z-frames
+        if crop_z_black_frames:
+            print(f"🔍 Analyzing z-stack for black frames (threshold: {z_crop_threshold})...")
+            fused = self._crop_black_z_frames(fused, threshold=z_crop_threshold)
+        
+        # Save to zarr
         with dask.diagnostics.ProgressBar():
             ngff_utils.write_sim_to_ome_zarr(fused, str(zarr_out), overwrite=True)
+            
+        # Optionally save to TIFF
         if export_tiff:
             tif_out = out / f"{name}.tif"
             with dask.diagnostics.ProgressBar():
                 io.save_sim_as_tif(str(tif_out), fused)
+    
+    def _crop_black_z_frames(self, sim, threshold=0.01):
+        """
+        Remove z-slices that contain ANY black/padding regions from a fused SIM.
+        
+        This looks at each z-slice across the entire subgrid and removes any slice
+        that has pixels below the threshold (indicating black padding regions).
+        
+        Parameters
+        ----------
+        sim : spatial_image
+            Fused spatial image
+        threshold : float
+            Threshold for detecting black pixels as fraction of global max intensity
+            
+        Returns
+        -------
+        spatial_image
+            Cropped spatial image with black z-frames removed
+        """
+        import dask.array as da
+        import numpy as np
+        
+        # Get data array and find z-dimension
+        data = sim.data
+        print(f"   → Original shape: {data.shape}")
+        print(f"   → Dimensions: {sim.dims}")
+        
+        # Find z-dimension index
+        z_dim_idx = None
+        for i, dim in enumerate(sim.dims):
+            if dim == 'z':
+                z_dim_idx = i
+                break
+        
+        if z_dim_idx is None:
+            print(f"   → No 'z' dimension found, skipping z-cropping")
+            return sim
+            
+        z_slices = data.shape[z_dim_idx]
+        print(f"   → Z-dimension at index {z_dim_idx} with {z_slices} slices")
+        
+        # Compute global max intensity to set threshold
+        global_max = da.max(data).compute()
+        intensity_threshold = global_max * threshold
+        print(f"   → Global max intensity: {global_max:.2f}")
+        print(f"   → Black pixel threshold: {intensity_threshold:.2f}")
+        
+        # Check for large black regions (400x400+ pixels) indicating padding tiles
+        # Find spatial dimensions (y and x)
+        y_dim_idx = None
+        x_dim_idx = None
+        for i, dim in enumerate(sim.dims):
+            if dim == 'y':
+                y_dim_idx = i
+            elif dim == 'x':
+                x_dim_idx = i
+        
+        if y_dim_idx is None or x_dim_idx is None:
+            print(f"   → Could not find y/x dimensions, skipping z-cropping")
+            return sim
+        
+        # Get spatial dimensions
+        y_size = data.shape[y_dim_idx]
+        x_size = data.shape[x_dim_idx]
+        
+        print(f"   → Spatial size: {y_size} x {x_size}")
+        print(f"   → Looking for black regions ≥ 400x400 pixels")
+        
+        # Check each z-slice for large black regions
+        min_black_size = 400  # 400x400 pixel minimum
+        good_z_slices = []
+        
+        # Find channel dimension
+        c_dim_idx = None
+        for i, dim in enumerate(sim.dims):
+            if dim == 'c':
+                c_dim_idx = i
+                break
+        
+        for z_idx in range(z_slices):
+            # Extract channel 0 of this z-slice only
+            slice_tuple = tuple(
+                0 if i == c_dim_idx else  # Channel 0 only
+                z_idx if i == z_dim_idx else  # This z-slice
+                slice(None)  # All other dimensions
+                for i in range(len(data.shape))
+            )
+            z_slice_ch0 = data[slice_tuple]
+            
+            # Compute this slice to check for black regions
+            z_slice_np = z_slice_ch0.compute()
+            
+            # Create binary mask of black pixels
+            black_mask = z_slice_np <= intensity_threshold
+            
+            # Use sliding window to find 400x400 black regions efficiently
+            has_large_black_region = self._has_large_black_region(black_mask, min_black_size)
+            
+            good_z_slices.append(not has_large_black_region)
+            
+            if z_idx % 10 == 0 or z_idx == z_slices - 1:
+                print(f"   → Processed z-slice {z_idx}/{z_slices-1}")
+        
+        good_z_slices = np.array(good_z_slices)
+        print(f"   → Found {np.sum(good_z_slices)} good slices out of {len(good_z_slices)}")
+        
+        if not np.any(good_z_slices):
+            print("   ⚠️ Warning: All z-slices contain black regions! Keeping original data.")
+            return sim
+        
+        # Find the range of good z-slices (first good to last good)
+        good_indices = np.where(good_z_slices)[0]
+        z_start = good_indices[0]
+        z_end = good_indices[-1] + 1  # +1 for inclusive end
+        
+        print(f"   → Good z-slices (no black pixels): {z_start} to {z_end-1} (total: {z_end - z_start})")
+        print(f"   → Removing {z_start} slices from start, {z_slices - z_end} slices from end")
+        
+        if z_start == 0 and z_end == z_slices:
+            print("   → No cropping needed - all slices are good!")
+            return sim
+        
+        # Simple slicing approach - just slice the original SIM data
+        # Create slice tuple for cropping
+        crop_tuple = tuple(slice(None) if i != z_dim_idx else slice(z_start, z_end) 
+                          for i in range(len(data.shape)))
+        
+        # Create a new SIM by slicing the original
+        cropped_sim = sim.isel({sim.dims[z_dim_idx]: slice(z_start, z_end)})
+        
+        print(f"   → Cropped shape: {cropped_sim.data.shape}")
+        
+        return cropped_sim
+
+    def _has_large_black_region(self, black_mask, min_size):
+        """
+        Efficiently check if a 2D binary mask has any contiguous black region >= min_size x min_size.
+        
+        Uses a sliding window approach for speed - much faster than connected components.
+        """
+        import numpy as np
+        
+        if black_mask.shape[0] < min_size or black_mask.shape[1] < min_size:
+            return False
+        
+        # Use sliding window to check for min_size x min_size black squares
+        # This is much faster than full connected component analysis
+        for y in range(black_mask.shape[0] - min_size + 1):
+            for x in range(black_mask.shape[1] - min_size + 1):
+                # Check if this min_size x min_size window is all black
+                window = black_mask[y:y+min_size, x:x+min_size]
+                if np.all(window):
+                    return True
+        
+        return False
 
 
 ############### EXTRA ############################# Cilantro. Added just before carrot
@@ -1025,7 +906,8 @@ class Stitcher:
         to the list of tile-dicts that share it.
         """
         groups = {}
-        p = re.compile(r"(.+__A\d+_G\d+)_\d+")
+        # p = re.compile(r"(.+__A\d+_G\d+)_\d+") # oh my god wahhh the issue was a double instead of a single underscore
+        p = re.compile(r"(.+_A\d+_G\d+)_\d+") # fixed
         for t in meta["tiles"]:
             fn = t.get("filename") or ""
             m = p.match(Path(fn).stem)
@@ -1033,121 +915,7 @@ class Stitcher:
                 groups.setdefault(m.group(1), []).append(t)
         return groups
 
-    # def build_group_meta(self, meta, group_tiles, prefix):
-    #     """
-    #     Build a “mini-meta” for just those tiles in `group_tiles`,
-    #     splitting *that* into subgrids and tagging each with an 'id'.
-    #     """
-    #     # --- 1) new grid_size based on x_index,y_index extents
-    #     max_x = max(t["x_index"] for t in group_tiles) + 1
-    #     max_y = max(t["y_index"] for t in group_tiles) + 1
-
-    #     # --- 2) shallow copy and overwrite only tiles & grid_size
-    #     gm = { **meta }
-    #     gm["tiles"]     = group_tiles
-    #     gm["grid_size"] = {"cols": max_x, "rows": max_y}
-
-    #     # --- 3) split into batches
-    #     batches = self.split_tiles_into_batches(
-    #         gm,
-    #         batch_shape=cfg.BATCH_GRID_SHAPE,
-    #         overlap_tiles=cfg.BATCH_TILE_OVERLAP
-    #     )
-
-    #     # --- 4) build subgrids list, each with an 'id'
-    #     gm["subgrids"] = []
-    #     bw, bh = cfg.BATCH_GRID_SHAPE
-    #     for i, b in enumerate(batches):
-    #         x0, y0 = b["x_start"], b["y_start"]
-    #         x1, y1 = min(max_x, x0 + bw), min(max_y, y0 + bh)
-    #         gm["subgrids"].append({
-    #             "id":      f"{prefix}_sg{i}",
-    #             "tiles":   b["tiles"],
-    #             "x_range": (x0, x1),
-    #             "y_range": (y0, y1),
-    #         })
-
-    #     # --- 5) recalc num_subgrids
-    #     gm["num_subgrids"] = {
-    #         "cols": math.ceil(max_x / bw),
-    #         "rows": math.ceil(max_y / bh)
-    #     }
-
-    #     return gm
-
-
-    # def build_dynamic_group_meta(self,
-    #                              meta,
-    #                              group_tiles,
-    #                              prefix,
-    #                              tif_folder):
-    #     """
-    #     Build a mini‐meta for the tiles in this G‐group, splitting the
-    #     rectangular grid into windows either:
-    #       • of size cfg.BATCH_GRID_SHAPE (if set), or
-    #       • of size S×S estimated by RAM (if BATCH_GRID_SHAPE is None)
-    #     with cfg.BATCH_TILE_OVERLAP tiles of overlap.
-    #     """
-    #     # 1) compute raw grid dimensions
-    #     grid_w = max(t["x_index"] for t in group_tiles) + 1
-    #     grid_h = max(t["y_index"] for t in group_tiles) + 1
-
-    #     # 2) decide your window size
-    #     if cfg.BATCH_GRID_SHAPE is None:
-    #         S = self._estimate_max_subgrid(Path(tif_folder),
-    #                                        cfg.SAFETY_FRACTION,
-    #                                        cfg.OVERHEAD_FACTOR)
-    #         w_req = h_req = S
-    #     else:
-    #         w_req, h_req = cfg.BATCH_GRID_SHAPE
-
-    #     overlap = cfg.BATCH_TILE_OVERLAP or 1
-    #     step_x  = w_req - overlap
-    #     step_y  = h_req - overlap
-
-    #     # 3) how many windows needed?
-    #     n_x = math.ceil((grid_w - overlap) / step_x)
-    #     n_y = math.ceil((grid_h - overlap) / step_y)
-
-    #     # 4) generate windows, nudging edges to stay full‐sized
-    #     windows = []
-    #     for ix in range(n_x):
-    #         for iy in range(n_y):
-    #             x0 = ix * step_x
-    #             y0 = iy * step_y
-    #             x1 = min(x0 + w_req, grid_w)
-    #             y1 = min(y0 + h_req, grid_h)
-
-    #             # if at right/bottom edge and window got clipped, shift back
-    #             if (x1 - x0) < w_req:
-    #                 x0 = max(0, grid_w - w_req)
-    #             if (y1 - y0) < h_req:
-    #                 y0 = max(0, grid_h - h_req)
-
-    #             windows.append((x0, x1, y0, y1))
-
-    #     # 5) build your subgrids list
-    #     subgrids = []
-    #     for i, (x0, x1, y0, y1) in enumerate(windows):
-    #         tiles_in_batch = [
-    #             t for t in group_tiles
-    #             if x0 <= t["x_index"] < x1 and y0 <= t["y_index"] < y1
-    #         ]
-    #         subgrids.append({
-    #             "id":      f"{prefix}_sg{i}",
-    #             "tiles":   tiles_in_batch,
-    #             "x_range": (x0, x1),
-    #             "y_range": (y0, y1),
-    #         })
-
-    #     # 6) pack it all into a mini‐meta
-    #     return {
-    #         **meta,
-    #         "tiles":        group_tiles,
-    #         "grid_size":    {"cols": grid_w,   "rows": grid_h},
-    #         "subgrids":     subgrids,
-    #         "num_subgrids": {"cols": n_x,       "rows": n_y    }
-    #     }
+   
 
     def build_dynamic_group_meta(self,
                                  meta,
@@ -1274,3 +1042,19 @@ def plot_full_and_subgrid(meta, scale, subgrid, ax=None):
     ax.set_title(f"Full grid (grey) + subgrid {subgrid['id']}")
     plt.tight_layout()
     return ax
+
+_bioformats = None
+def _get_bioformats():
+    """
+    Lazily initialize the JVM against your local Fiji.app,
+    and return (IJ, BF, ImporterOptions).
+    """
+    global _bioformats
+    if _bioformats is None:
+        # use the path from config
+        ij_dir = str(cfg.FIJI_APP)
+        IJ = imagej.init(ij_dir, mode="headless", add_legacy=True)
+        BF = scyjava.jimport("loci.plugins.BF")
+        ImporterOptions = scyjava.jimport("loci.plugins.in.ImporterOptions")
+        _bioformats = (IJ, BF, ImporterOptions)
+    return _bioformats
