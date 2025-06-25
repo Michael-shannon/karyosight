@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import napari
 from pathlib import Path
 from karyosight.config import CROPPED_DIR, CONDITION_PREF
+from scipy import ndimage
 
 # import karyosight.config as cfg
 
@@ -65,11 +66,20 @@ class Cropper:
                                 pad_pct: float = 0.6,
                                 pad_step: float = 0.05,
                                 visualize: bool = False,
-                                verbose:   bool = False):
+                                verbose:   bool = False,
+                                filter_edge_cropped: bool = None):
         """
         Segment level `self.low_level` to find centroids + padded bboxes,
         shrink to only the main organoid, overlay contours, and print diagnostics.
+        
+        Parameters
+        ----------
+        filter_edge_cropped : bool, optional
+            Whether to filter out edge-cropped organoids. If None, uses config.FILTER_EDGE_CROPPED
         """
+        # Import config here to avoid circular imports
+        from karyosight.config import (FILTER_EDGE_CROPPED, EDGE_PROXIMITY_THRESHOLD, 
+                                      STRAIGHT_EDGE_THRESHOLD, BLACK_REGION_THRESHOLD)
         # 1) load and project
         root = zarr.open_group(str(zarr_path), mode='r')
         arr  = root[str(self.low_level)][:]  # (t,c,z,y,x)
@@ -96,6 +106,27 @@ class Cropper:
         ]
         if verbose:
             print(f"🔍 Found {len(big_props)} large organoids (min_area={min_area})")
+
+        # Filter out edge-cropped organoids BEFORE expensive processing
+        if filter_edge_cropped is None:
+            filter_edge_cropped = FILTER_EDGE_CROPPED
+            
+        if filter_edge_cropped:
+            edge_cropped_indices = self.detect_edge_cropped_organoids(
+                label_img, big_props, 
+                edge_proximity_threshold=EDGE_PROXIMITY_THRESHOLD,
+                straight_edge_threshold=STRAIGHT_EDGE_THRESHOLD,
+                black_region_threshold=BLACK_REGION_THRESHOLD,
+                verbose=verbose
+            )
+            
+            # Remove edge-cropped organoids from processing list
+            big_props = [p for i, p in enumerate(big_props) if i not in edge_cropped_indices]
+            
+            if verbose and edge_cropped_indices:
+                print(f"✂️  After edge filtering: {len(big_props)} organoids remaining")
+        elif verbose:
+            print(f"⚠️  Edge filtering disabled")
 
         # map each organoid label → its raw low-res bbox
         lowres_bbox_map = {p.label: p.bbox for p in big_props}
@@ -266,9 +297,11 @@ class Cropper:
                              remove_black_frames: bool = True,
                              black_frame_threshold: float = 0.001,
                              black_frame_method: str = 'intensity_threshold',
-                             min_z_slices: int = 3):
+                             min_z_slices: int = 3,
+                             uniform_padding: bool = False,
+                             save_only_level0: bool = True):
         """
-        Upscale ROIs, crop full-res, pad to uniform size, and bundle into one Zarr.
+        Upscale ROIs, crop full-res, optionally pad to uniform size, and bundle into one Zarr.
         If a bundled zarr already exists for this condition, append new ROIs to it.
 
         Parameters
@@ -297,6 +330,12 @@ class Cropper:
             Method for black frame detection: 'intensity_threshold', 'content_ratio', or 'mean_intensity'
         min_z_slices : int, optional
             Minimum number of z-slices to keep when removing black frames
+        uniform_padding : bool, optional
+            If True, pad all organoids to same size (legacy behavior). 
+            If False, store each organoid with its original dimensions (MUCH faster, recommended).
+        save_only_level0 : bool, optional
+            If True, only save level 0 (highest resolution) data to save space and time.
+            If False, save all pyramid levels (legacy behavior).
         """
         # 1) Determine how much RAM we can use for a *single* ROI uncompressed
         if memory_limit_bytes is None:
@@ -345,16 +384,24 @@ class Cropper:
         arr_low  = root[str(self.low_level)]
         arr_high = root[str(self.high_level)]
         dtype    = arr_high.dtype
+        
+        print(f"🎯 Save only level 0: {save_only_level0}")
+        if save_only_level0:
+            print(f"   → Will save only level {self.high_level} (highest resolution) to optimize speed/storage")
 
         # 5) Compute the scale factors (low→high)
         sy = arr_high.shape[-2] / arr_low.shape[-2]
         sx = arr_high.shape[-1] / arr_low.shape[-1]
 
         # 6) Compute each ROI's high-res shape (c, z, H, W), check against memory_limit
-        #    Also track (Hmax, Wmax) so we know how big to pad.
+        #    Also track (Hmax, Wmax) for uniform padding (if enabled)
         Hmax = 0
         Wmax = 0
         roi_scaled_info = []
+        
+        print(f"🎯 Uniform padding: {uniform_padding}")
+        if not uniform_padding:
+            print(f"   → Using variable-size storage (no padding) for maximum efficiency")
 
         for i, roi in enumerate(rois):
             r0, c0, r1, c1 = roi['bbox']
@@ -389,8 +436,10 @@ class Cropper:
                     f"requires {bytes_for_this_roi/1e9:.2f} GB > {memory_limit_bytes/1e9:.2f} GB"
                 )
 
-            Hmax = max(Hmax, high_h)
-            Wmax = max(Wmax, high_w)
+            # Only track max dimensions if using uniform padding
+            if uniform_padding:
+                Hmax = max(Hmax, high_h)
+                Wmax = max(Wmax, high_w)
 
             roi_scaled_info.append({
                 'low_bbox': roi['bbox'],
@@ -650,7 +699,197 @@ class Cropper:
         print(f"✅ Successfully bundled {total_n_rois} ROIs for {cond}")
         return out_grp
 
+    def bundle_and_save_rois_simple_optimized(self,
+                                              zarr_path: Path,
+                                              rois: list,
+                                              memory_limit_bytes: int = None,
+                                              z_extraction_mode: str = 'peak',
+                                              z_slices_around_peak: int = 16,
+                                              intensity_channel: int = 0,
+                                              remove_black_frames: bool = False,
+                                              black_frame_threshold: float = 0.001,
+                                              black_frame_method: str = 'intensity_threshold',
+                                              min_z_slices: int = 3):
+        """
+        SIMPLE OPTIMIZED version: Single bundled zarr but NO PADDING.
+        Each organoid stored with its original dimensions using zarr groups.
+        
+        This is much simpler than the individual zarr approach but still eliminates
+        the massive waste from padding all organoids to the same size.
+        
+        Benefits:
+        - NO PADDING: Each organoid keeps original dimensions
+        - SINGLE ZARR: One file per condition (like original)
+        - NO JSON: Uses zarr attributes for metadata
+        - FASTER: No padding computations
+        - RESUMABLE: Skips existing organoids
+        """
+        
+        print(f"🚀 SIMPLE OPTIMIZED CROPPING: Single zarr, no padding")
+        print(f"   → Z-mode: {z_extraction_mode}")
+        print(f"   → Black frame removal: {remove_black_frames}")
+        
+        # 1) Memory and path setup
+        if memory_limit_bytes is None:
+            vm = psutil.virtual_memory()
+            memory_limit_bytes = int(0.8 * vm.available)
 
+        src = Path(zarr_path)
+        cond_dir = next(
+            (p for p in src.parents if p.name.startswith(CONDITION_PREF)),
+            None
+        )
+        if cond_dir is None:
+            raise RuntimeError(f"No Condition_ parent for {src!r}")
+        cond = cond_dir.name
+
+        # 2) Setup output zarr
+        out_grp = Path(self.cropped_dir) / cond / f"{cond}_bundled.zarr"
+        out_grp.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Open or create zarr group
+        if out_grp.exists():
+            bundle_group = zarr.open_group(str(out_grp), mode='r+')
+            existing_count = len([k for k in bundle_group.keys() if k.startswith('organoid_')])
+            print(f"📂 Found existing bundle with {existing_count} organoids")
+        else:
+            bundle_group = zarr.open_group(str(out_grp), mode='w')
+            existing_count = 0
+            bundle_group.attrs['storage_type'] = 'variable_size_groups'
+            bundle_group.attrs['condition'] = cond
+
+        # 3) Open stitched zarr
+        root = zarr.open_group(str(zarr_path), mode='r')
+        arr_high = root[str(self.high_level)]
+        
+        # Scale factors  
+        arr_low = root[str(self.low_level)]
+        sy = arr_high.shape[-2] / arr_low.shape[-2]
+        sx = arr_high.shape[-1] / arr_low.shape[-1]
+        
+        if z_extraction_mode == 'peak':
+            target_z_slices = 2 * z_slices_around_peak + 1
+            print(f"🎯 Peak mode: {target_z_slices} z-slices ({z_slices_around_peak} above/below)")
+        
+        # 4) Process each ROI
+        processed_count = 0
+        for i, roi in enumerate(rois):
+            organoid_idx = existing_count + i
+            organoid_key = f"organoid_{organoid_idx:04d}"
+            
+            # Skip if already exists
+            if organoid_key in bundle_group:
+                print(f"   ⏭️  Skipping existing {organoid_key}")
+                continue
+            
+            try:
+                # Process single organoid
+                organoid_data, metadata = self._process_single_organoid_simple(
+                    roi, arr_high, sy, sx, organoid_idx,
+                    z_extraction_mode, z_slices_around_peak, intensity_channel,
+                    remove_black_frames, black_frame_threshold, 
+                    black_frame_method, min_z_slices
+                )
+                
+                if organoid_data is not None:
+                    # Store in zarr group with original dimensions (NO PADDING!)
+                    organoid_group = bundle_group.create_group(organoid_key)
+                    organoid_group.create_dataset(
+                        'data',
+                        data=organoid_data,
+                        chunks=(1, min(organoid_data.shape[1], 10), 
+                               min(organoid_data.shape[2], 256), 
+                               min(organoid_data.shape[3], 256)),
+                        compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.SHUFFLE)
+                    )
+                    
+                    # Store metadata as attributes
+                    for key, value in metadata.items():
+                        organoid_group.attrs[key] = value
+                    
+                    processed_count += 1
+                    print(f"   ✅ {organoid_key}: {organoid_data.shape}")
+                
+            except Exception as e:
+                print(f"   ❌ Error processing {organoid_key}: {e}")
+                continue
+        
+        # 5) Update bundle metadata
+        bundle_group.attrs['n_organoids'] = existing_count + processed_count
+        from datetime import datetime
+        bundle_group.attrs['last_updated'] = str(datetime.now())
+        
+        print(f"🏁 Simple optimized processing complete!")
+        print(f"   → Total organoids: {existing_count + processed_count}")
+        print(f"   → New organoids: {processed_count}")
+        print(f"   → Bundle: {out_grp}")
+        
+        return out_grp
+    
+    def _process_single_organoid_simple(self, roi, arr_high, sy, sx, organoid_idx,
+                                       z_extraction_mode, z_slices_around_peak, intensity_channel,
+                                       remove_black_frames, black_frame_threshold, 
+                                       black_frame_method, min_z_slices):
+        """Process single organoid for simple optimized approach."""
+        
+        # Convert bbox to high-res coordinates
+        r0, c0, r1, c1 = roi['bbox']
+        hr0 = int(np.round(r0 * sy))
+        hc0 = int(np.round(c0 * sx))
+        hr1 = int(np.round(r1 * sy))
+        hc1 = int(np.round(c1 * sx))
+        
+        # Extract subvolume
+        if arr_high.ndim == 5 and arr_high.shape[0] == 1:
+            subvol = arr_high[0, :, :, hr0:hr1, hc0:hc1]
+        else:
+            subvol = arr_high[:, :, hr0:hr1, hc0:hc1]
+        
+        # Handle collisions
+        for lbl in roi.get('collision_labels', []):
+            orig_bbox_map = roi.get('orig_bbox_map', {})
+            if lbl in orig_bbox_map:
+                lr0, lc0, lr1, lc1 = orig_bbox_map[lbl]
+                qhr0 = max(0, int(np.round(lr0 * sy)) - hr0)
+                qhr1 = min(subvol.shape[-2], int(np.round(lr1 * sy)) - hr0)
+                qhc0 = max(0, int(np.round(lc0 * sx)) - hc0)
+                qhc1 = min(subvol.shape[-1], int(np.round(lc1 * sx)) - hc0)
+                subvol[..., qhr0:qhr1, qhc0:qhc1] = 0
+        
+        # Z-dimension processing
+        if z_extraction_mode == 'peak':
+            intensity_data = subvol[intensity_channel]
+            z_sums = np.sum(intensity_data, axis=(1, 2))
+            peak_z = np.argmax(z_sums)
+            
+            z_start = max(0, peak_z - z_slices_around_peak)
+            z_end = min(subvol.shape[1], peak_z + z_slices_around_peak + 1)
+            subvol = subvol[:, z_start:z_end, :, :]
+            
+            # Pad z if needed (at edges)
+            target_z = 2 * z_slices_around_peak + 1
+            if subvol.shape[1] < target_z:
+                z_pad = target_z - subvol.shape[1]
+                pad_spec = ((0, 0), (0, z_pad), (0, 0), (0, 0))
+                subvol = np.pad(subvol, pad_spec, mode='constant', constant_values=0)
+        
+        # Optional black frame removal
+        if remove_black_frames and subvol.shape[1] > min_z_slices:
+            subvol = self.remove_black_z_slices(
+                subvol, black_frame_threshold, black_frame_method, min_z_slices, verbose=False
+            )
+        
+        # Create metadata
+        metadata = {
+            'organoid_idx': organoid_idx,
+            'original_bbox_lowres': roi['bbox'],
+            'bbox_highres': [hr0, hc0, hr1, hc1],
+            'centroid_lowres': roi.get('centroid', [np.nan, np.nan]),
+            'shape': list(subvol.shape),
+            'z_extraction_mode': z_extraction_mode
+        }
+        
+        return subvol, metadata
 
     def view_bundled_roi_notebook(self,
                                    bundled_path: Path,
@@ -784,3 +1023,156 @@ class Cropper:
         
         # Return cropped volume
         return volume[:, keep_mask, :, :]
+
+    @staticmethod
+    def detect_edge_cropped_organoids(label_img, props, edge_proximity_threshold=0.05, 
+                                    straight_edge_threshold=0.7, black_region_threshold=0.3,
+                                    verbose=False):
+        """
+        Detect organoids that are cropped at image boundaries by analyzing:
+        1. Proximity to image edges
+        2. Presence of straight edges in the organoid boundary
+        3. Large black regions adjacent to the organoid
+        
+        Parameters
+        ----------
+        label_img : ndarray
+            Labeled image from skimage.measure.label
+        props : list
+            List of regionprops objects
+        edge_proximity_threshold : float
+            Distance from image edge as fraction of image size (default: 0.05 = 5%)
+        straight_edge_threshold : float
+            Minimum ratio of straight edge pixels to total perimeter (default: 0.7)
+        black_region_threshold : float
+            Minimum ratio of black pixels in extended bbox (default: 0.3)
+        verbose : bool
+            Print debugging information
+            
+        Returns
+        -------
+        list
+            Indices of organoids that should be filtered out (edge-cropped)
+        """
+        if verbose:
+            print(f"🔍 Checking {len(props)} organoids for edge cropping...")
+            
+        H, W = label_img.shape
+        edge_cropped_indices = []
+        
+        # Define edge proximity thresholds in pixels
+        edge_h = int(H * edge_proximity_threshold)
+        edge_w = int(W * edge_proximity_threshold)
+        
+        for i, prop in enumerate(props):
+            is_edge_cropped = False
+            reasons = []
+            
+            # Get organoid mask and bbox
+            mask = (label_img == prop.label)
+            minr, minc, maxr, maxc = prop.bbox
+            
+            # 1. Check proximity to image boundaries
+            near_edge = (minr <= edge_h or maxr >= H - edge_h or 
+                        minc <= edge_w or maxc >= W - edge_w)
+            
+            if not near_edge:
+                continue  # Skip detailed analysis if not near edge
+                
+            # 2. Analyze boundary for straight edges
+            # Get perimeter coordinates
+            coords = np.column_stack(np.where(mask))
+            if len(coords) == 0:
+                continue
+                
+            # Find boundary pixels using morphological operations
+            from skimage.morphology import binary_erosion
+            boundary = mask & ~binary_erosion(mask)
+            boundary_coords = np.column_stack(np.where(boundary))
+            
+            if len(boundary_coords) < 10:  # Skip if too few boundary pixels
+                continue
+                
+            # Detect straight edges by analyzing boundary pixel alignment
+            straight_edge_ratio = Cropper._analyze_boundary_straightness(boundary_coords)
+            
+            # 3. Check for large black regions in extended bbox
+            # Extend bbox slightly to capture adjacent black regions
+            pad = max(10, int(min(maxr-minr, maxc-minc) * 0.1))
+            ext_minr = max(0, minr - pad)
+            ext_minc = max(0, minc - pad) 
+            ext_maxr = min(H, maxr + pad)
+            ext_maxc = min(W, maxc + pad)
+            
+            # Extract extended region and check for black areas
+            extended_region = label_img[ext_minr:ext_maxr, ext_minc:ext_maxc]
+            black_ratio = np.sum(extended_region == 0) / extended_region.size
+            
+            # Decision logic
+            if straight_edge_ratio > straight_edge_threshold:
+                is_edge_cropped = True
+                reasons.append(f"straight_edge={straight_edge_ratio:.2f}")
+                
+            if black_ratio > black_region_threshold and near_edge:
+                is_edge_cropped = True
+                reasons.append(f"black_region={black_ratio:.2f}")
+                
+            # Additional check: organoid touches image border directly
+            if (minr == 0 or maxr == H or minc == 0 or maxc == W):
+                is_edge_cropped = True
+                reasons.append("touches_border")
+            
+            if is_edge_cropped:
+                edge_cropped_indices.append(i)
+                if verbose:
+                    print(f"   ❌ Organoid {prop.label} (#{i}): {', '.join(reasons)}")
+            elif verbose:
+                print(f"   ✅ Organoid {prop.label} (#{i}): OK")
+                
+        if verbose:
+            print(f"🗑️  Filtered out {len(edge_cropped_indices)}/{len(props)} edge-cropped organoids")
+            
+        return edge_cropped_indices
+    
+    @staticmethod
+    def _analyze_boundary_straightness(boundary_coords, line_tolerance=3):
+        """
+        Analyze boundary coordinates for straight line segments.
+        Returns the ratio of pixels that lie on straight lines.
+        """
+        if len(boundary_coords) < 10:
+            return 0.0
+            
+        # Sort boundary coordinates by angle from centroid to create ordered perimeter
+        centroid = np.mean(boundary_coords, axis=0)
+        angles = np.arctan2(boundary_coords[:, 0] - centroid[0], 
+                           boundary_coords[:, 1] - centroid[1])
+        sorted_indices = np.argsort(angles)
+        sorted_coords = boundary_coords[sorted_indices]
+        
+        # Sliding window analysis for straight line segments
+        window_size = min(20, len(sorted_coords) // 4)
+        straight_pixels = 0
+        
+        for i in range(len(sorted_coords) - window_size + 1):
+            window = sorted_coords[i:i+window_size]
+            
+            # Fit line to window using least squares
+            if len(window) < 3:
+                continue
+                
+            # Calculate line fit quality
+            x, y = window[:, 1], window[:, 0]  # Note: coords are (row, col)
+            if np.var(x) > np.var(y):  # Fit y = mx + b
+                coeffs = np.polyfit(x, y, 1)
+                fitted_y = np.polyval(coeffs, x)
+                distances = np.abs(y - fitted_y)
+            else:  # Fit x = my + b  
+                coeffs = np.polyfit(y, x, 1)
+                fitted_x = np.polyval(coeffs, y)
+                distances = np.abs(x - fitted_x)
+                
+            # Count pixels close to fitted line
+            straight_pixels += np.sum(distances <= line_tolerance)
+            
+        return straight_pixels / len(boundary_coords) if len(boundary_coords) > 0 else 0.0

@@ -229,7 +229,18 @@ class OrganoidVisualizer:
             try:
                 # Open zarr and get organoid count
                 bundle = zarr.open_group(str(zarr_path), mode='r')
-                n_organoids = bundle['data'].shape[0]
+                
+                # Check storage type
+                storage_type = bundle.attrs.get('storage_type', 'uniform_padding')
+                
+                if storage_type == 'variable_size_groups':
+                    # NEW OPTIMIZED FORMAT: Count organoid groups
+                    organoid_keys = [k for k in bundle.keys() if k.startswith('organoid_')]
+                    n_organoids = len(organoid_keys)
+                else:
+                    # LEGACY FORMAT: Count from data array
+                    n_organoids = bundle['data'].shape[0]
+                
                 counts[condition] = n_organoids
                 print(f"{condition}: {n_organoids} organoids")
                 
@@ -267,29 +278,60 @@ class OrganoidVisualizer:
         """
         bundle = zarr.open_group(str(zarr_path), mode='r')
         
-        # Check if the specified level exists
-        if str(level) in bundle:
-            data = bundle[str(level)]
-        else:
-            # Fall back to main data array
-            data = bundle['data']
+        # Check storage type to handle different formats
+        storage_type = bundle.attrs.get('storage_type', 'uniform_padding')
+        
+        if storage_type == 'variable_size_groups':
+            # NEW OPTIMIZED FORMAT: Variable-size groups
+            organoid_keys = sorted([k for k in bundle.keys() if k.startswith('organoid_')])
+            total_organoids = len(organoid_keys)
             
-        total_organoids = data.shape[0]
-        
-        # Determine which organoids to load
-        if sample_count is None or sample_count >= total_organoids:
-            indices = list(range(total_organoids))
+            # Determine which organoids to load
+            if sample_count is None or sample_count >= total_organoids:
+                indices = list(range(total_organoids))
+                selected_keys = organoid_keys
+            else:
+                # Randomly sample organoids
+                indices = np.random.choice(total_organoids, sample_count, replace=False).tolist()
+                indices.sort()
+                selected_keys = [organoid_keys[i] for i in indices]
+            
+            # Load data for selected organoids
+            max_projections = []
+            for key in selected_keys:
+                organoid_group = bundle[key]
+                organoid_data = organoid_group['data'][channel]  # Shape: (z, y, x)
+                max_proj = np.max(organoid_data, axis=0)  # Max projection along z
+                max_projections.append(max_proj)
+            
+            # For variable-size format, return as list instead of numpy array
+            return max_projections, indices
+                
         else:
-            # Randomly sample organoids
-            indices = np.random.choice(total_organoids, sample_count, replace=False).tolist()
-            indices.sort()
-        
-        # Load data for selected organoids
-        max_projections = []
-        for idx in indices:
-            organoid_data = data[idx, channel]  # Shape: (z, y, x)
-            max_proj = np.max(organoid_data, axis=0)  # Max projection along z
-            max_projections.append(max_proj)
+            # LEGACY FORMAT: Uniform padding in single array
+            # Check if the specified level exists
+            if str(level) in bundle:
+                data = bundle[str(level)]
+            else:
+                # Fall back to main data array
+                data = bundle['data']
+                
+            total_organoids = data.shape[0]
+            
+            # Determine which organoids to load
+            if sample_count is None or sample_count >= total_organoids:
+                indices = list(range(total_organoids))
+            else:
+                # Randomly sample organoids
+                indices = np.random.choice(total_organoids, sample_count, replace=False).tolist()
+                indices.sort()
+            
+            # Load data for selected organoids
+            max_projections = []
+            for idx in indices:
+                organoid_data = data[idx, channel]  # Shape: (z, y, x)
+                max_proj = np.max(organoid_data, axis=0)  # Max projection along z
+                max_projections.append(max_proj)
             
         return np.array(max_projections), indices
     
@@ -401,8 +443,28 @@ class OrganoidVisualizer:
         fig_width = cols * figsize_per_organoid[0]
         fig_height = rows * figsize_per_organoid[1]
         
-        # Compute scaling
-        vmin_vals, vmax_vals = self._compute_scaling(projections, auto_scale_method)
+        # Handle both list (variable-size) and numpy array (uniform-size) formats
+        if isinstance(projections, list):
+            # Variable-size projections - compute scaling for each individually
+            vmin_vals = []
+            vmax_vals = []
+            for proj in projections:
+                if auto_scale_method == 'individual':
+                    vmin = np.percentile(proj[proj > 0], 1) if np.any(proj > 0) else 0
+                    vmax = np.percentile(proj, 99.5)
+                else:  # global - compute from all projections
+                    all_nonzero = np.concatenate([p[p > 0] for p in projections if np.any(p > 0)])
+                    if len(all_nonzero) > 0:
+                        vmin = np.percentile(all_nonzero, 1)
+                        vmax = np.percentile(np.concatenate([p.flatten() for p in projections]), 99.5)
+                    else:
+                        vmin = 0
+                        vmax = max(p.max() for p in projections)
+                vmin_vals.append(vmin)
+                vmax_vals.append(vmax)
+        else:
+            # Uniform-size projections - use original method
+            vmin_vals, vmax_vals = self._compute_scaling(projections, auto_scale_method)
         
         # Create the figure
         fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height))
@@ -415,7 +477,13 @@ class OrganoidVisualizer:
         for i, (proj, idx) in enumerate(zip(projections, indices)):
             ax = axes[i]
             
-            im = ax.imshow(proj, cmap='gray', vmin=vmin_vals[i], vmax=vmax_vals[i])
+            # Handle both list and array indexing for vmin/vmax
+            if isinstance(vmin_vals, list):
+                vmin, vmax = vmin_vals[i], vmax_vals[i]
+            else:
+                vmin, vmax = vmin_vals[i], vmax_vals[i]
+            
+            im = ax.imshow(proj, cmap='gray', vmin=vmin, vmax=vmax)
             ax.set_title(f'Organoid {idx}', fontsize=8)
             ax.axis('off')
         
@@ -514,99 +582,355 @@ class OrganoidVisualizer:
                                 save_png: bool = True,
                                 show_plot: bool = True) -> Optional[Path]:
         """
-        Create a comparison view of a single organoid across multiple channels.
+        Create a comparison plot showing the same organoid across different channels.
         
         Parameters
         ----------
         condition : str
-            Condition name
-        organoid_idx : int
-            Index of organoid to visualize
-        level : int
-            Zarr pyramid level
-        channels : list, optional
-            List of channel indices. If None, use all 6 channels.
-        auto_scale_method : str
-            Scaling method
-        save_png : bool
-            Whether to save the figure
-        show_plot : bool
+            Condition name (e.g., 'Condition_DMSO')
+        organoid_idx : int, optional
+            Index of the organoid to show (default: 0)
+        level : int, optional
+            Resolution level to use (default: 1)
+        channels : List[int], optional
+            List of channels to show. If None, shows channels 0-5
+        auto_scale_method : str, optional
+            How to scale intensities: 'individual' or 'global'
+        save_png : bool, optional
+            Whether to save as PNG file
+        show_plot : bool, optional
             Whether to display the plot
             
         Returns
         -------
-        Path or None
-            Path to saved figure
+        Optional[Path]
+            Path to saved PNG file if save_png=True, otherwise None
         """
         if channels is None:
-            channels = list(range(6))  # All 6 channels
+            channels = list(range(6))  # CH1-CH6 (0-5)
+            
+        # Find the bundled zarr file
+        condition_dir = self.cropped_dir / condition
+        zarr_files = list(condition_dir.glob("*bundled.zarr"))
         
-        zarr_path = self.cropped_dir / condition / f"{condition}_bundled.zarr"
-        if not zarr_path.exists():
-            print(f"Warning: No bundled zarr found for condition {condition}")
+        if not zarr_files:
+            print(f"❌ No bundled zarr found in {condition_dir}")
             return None
+            
+        zarr_path = zarr_files[0]
         
-        # Load organoid data for all channels
-        bundle = zarr.open_group(str(zarr_path), mode='r')
-        
-        if str(level) in bundle:
-            data = bundle[str(level)]
-        else:
-            data = bundle['data']
-        
-        if organoid_idx >= data.shape[0]:
-            print(f"Organoid index {organoid_idx} out of range (max: {data.shape[0]-1})")
+        try:
+            # Load organoid data directly from zarr for channel comparison
+            bundle = zarr.open_group(str(zarr_path), mode='r')
+            storage_type = bundle.attrs.get('storage_type', 'uniform_padding')
+            
+            if storage_type == 'variable_size_groups':
+                # NEW OPTIMIZED FORMAT: Load specific organoid directly
+                organoid_key = f"organoid_{organoid_idx:04d}"
+                if organoid_key not in bundle:
+                    available_organoids = len([k for k in bundle.keys() if k.startswith('organoid_')])
+                    print(f"❌ Organoid index {organoid_idx} not found (only {available_organoids} organoids available)")
+                    return None
+                
+                organoid_group = bundle[organoid_key]
+                organoid_data = organoid_group['data'][:]  # Shape: (n_channels, z, y, x)
+                
+            else:
+                # LEGACY FORMAT: Load from uniform array
+                if 'data' not in bundle:
+                    print(f"❌ No data found in {zarr_path}")
+                    return None
+                    
+                data = bundle['data']
+                if organoid_idx >= data.shape[0]:
+                    print(f"❌ Organoid index {organoid_idx} not found (only {data.shape[0]} organoids available)")
+                    return None
+                
+                organoid_data = data[organoid_idx]  # Shape: (n_channels, z, y, x)
+            
+            # Create projection for each channel
+            projections = []
+            valid_channels = []
+            
+            for ch in channels:
+                if ch < organoid_data.shape[0]:
+                    proj = np.max(organoid_data[ch], axis=0)  # Max projection
+                    projections.append(proj)
+                    valid_channels.append(ch)
+                else:
+                    print(f"⚠️ Channel {ch} not available (only {organoid_data.shape[0]} channels)")
+            
+            if not projections:
+                print("❌ No valid channels found")
+                return None
+                
+            projections = np.array(projections)
+            
+            # Calculate scaling
+            vmin_vals, vmax_vals = self._compute_scaling(projections, auto_scale_method)
+            
+            # Create the plot
+            n_channels = len(valid_channels)
+            cols = min(3, n_channels)
+            rows = (n_channels + cols - 1) // cols
+            
+            fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+            if n_channels == 1:
+                axes = [axes]
+            elif rows == 1:
+                axes = axes.reshape(1, -1)
+            
+            # Plot each channel
+            for i, (ch, proj) in enumerate(zip(valid_channels, projections)):
+                row = i // cols
+                col = i % cols
+                ax = axes[row, col] if rows > 1 else axes[col]
+                
+                im = ax.imshow(proj, cmap='gray', vmin=vmin_vals[i], vmax=vmax_vals[i])
+                ax.set_title(f'CH{ch+1}', fontsize=10, fontweight='bold')
+                ax.axis('off')
+                
+                # Add colorbar
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            
+            # Hide unused subplots
+            for i in range(n_channels, rows * cols):
+                row = i // cols
+                col = i % cols
+                if rows > 1:
+                    axes[row, col].axis('off')
+                else:
+                    axes[col].axis('off')
+            
+            fig.suptitle(f'{condition} - Organoid {organoid_idx} - Channel Comparison', 
+                        fontsize=12, fontweight='bold')
+            plt.tight_layout()
+            
+            # Save if requested
+            saved_path = None
+            if save_png:
+                filename = f"{condition}_organoid{organoid_idx}_channels.png"
+                saved_path = condition_dir / filename
+                fig.savefig(saved_path, dpi=150, bbox_inches='tight')
+                print(f"💾 Saved: {saved_path}")
+            
+            if show_plot:
+                plt.show()
+            else:
+                plt.close(fig)
+                
+        except Exception as e:
+            print(f"❌ Error creating channel comparison: {e}")
             return None
+            
+        return saved_path
+
+    def view_organoid_z_slices(self,
+                              condition: str,
+                              organoid_idx: int = 0,
+                              channel: int = 0,
+                              level: int = 1,
+                              z_slices: Optional[int] = None,
+                              save_png: bool = True,
+                              show_plot: bool = True) -> Optional[Path]:
+        """
+        Visualize specific z-slices of an organoid with flexible slice selection.
         
-        # Create subplot grid
-        n_channels = len(channels)
-        cols = min(3, n_channels)
-        rows = int(np.ceil(n_channels / cols))
+        Parameters
+        ----------
+        condition : str
+            Condition name (e.g., 'Condition_DMSO')
+        organoid_idx : int, optional
+            Index of the organoid to show (default: 0)
+        channel : int, optional
+            Channel to visualize (0-5 for CH1-CH6, default: 0)
+        level : int, optional
+            Resolution level to use (default: 1)
+        z_slices : int or None, optional
+            Number of z-slices to show:
+            - None: show all z-slices
+            - 3: show top, middle, and bottom slices
+            - 9 (or other number): show evenly spaced slices including top and bottom
+        save_png : bool, optional
+            Whether to save as PNG file
+        show_plot : bool, optional
+            Whether to display the plot
+            
+        Returns
+        -------
+        Optional[Path]
+            Path to saved PNG file if save_png=True, otherwise None
+        """
+        # Find the bundled zarr file
+        condition_dir = self.cropped_dir / condition
+        zarr_files = list(condition_dir.glob("*bundled.zarr"))
         
-        fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-        if n_channels == 1:
-            axes = [axes]
-        else:
-            axes = axes.flatten() if rows > 1 or cols > 1 else [axes]
+        if not zarr_files:
+            print(f"❌ No bundled zarr found in {condition_dir}")
+            return None
+            
+        zarr_path = zarr_files[0]
         
-        projections = []
-        for ch in channels:
-            organoid_data = data[organoid_idx, ch]  # Shape: (z, y, x)
-            max_proj = np.max(organoid_data, axis=0)
-            projections.append(max_proj)
-        
-        # Compute scaling
-        projections_array = np.array(projections)
-        vmin_vals, vmax_vals = self._compute_scaling(projections_array, auto_scale_method)
-        
-        # Plot each channel
-        for i, (ch, proj) in enumerate(zip(channels, projections)):
-            ax = axes[i]
-            im = ax.imshow(proj, cmap='gray', vmin=vmin_vals[i], vmax=vmax_vals[i])
-            ax.set_title(f'CH{ch + 1}', fontsize=10)
-            ax.axis('off')
-        
-        # Hide unused subplots
-        for i in range(len(channels), len(axes)):
-            axes[i].axis('off')
-        
-        title = f"{condition} - Organoid {organoid_idx} - All Channels (Level {level})"
-        fig.suptitle(title, fontsize=12, y=0.98)
-        plt.tight_layout()
-        
-        # Save if requested
-        saved_path = None
-        if save_png:
-            filename = f"{condition}_organoid{organoid_idx}_allchannels_level{level}.png"
-            saved_path = self.vis_dir / filename
-            plt.savefig(saved_path, dpi=150, bbox_inches='tight')
-            print(f"Saved channel comparison: {saved_path}")
-        
-        if show_plot:
-            plt.show()
-        else:
-            plt.close()
-        
+        try:
+            # Load the bundled zarr file - handle both old and new storage formats
+            bundle = zarr.open_group(str(zarr_path), mode='r')
+            
+            # Check storage type
+            storage_type = bundle.attrs.get('storage_type', 'uniform_padding')
+            
+            if storage_type == 'individual_zarrs':
+                # COMPLEX OPTIMIZED FORMAT: Individual zarr files
+                import json
+                metadata = json.loads(bundle.attrs['metadata'])
+                
+                if organoid_idx >= len(metadata):
+                    print(f"❌ Organoid index {organoid_idx} not found (only {len(metadata)} organoids available)")
+                    return None
+                
+                # Load individual organoid zarr
+                organoid_info = metadata[organoid_idx]
+                organoid_zarr_name = organoid_info['zarr_file']
+                organoid_zarr_path = zarr_path.parent / organoid_zarr_name
+                
+                organoid_group = zarr.open_group(str(organoid_zarr_path), mode='r')
+                organoid_data = organoid_group['data'][:]  # Shape: (c, z, y, x)
+                organoid_volume = organoid_data[channel]  # Shape: (z, y, x)
+                
+                print(f"📊 Organoid volume shape: {organoid_volume.shape} (complex optimized format)")
+                print(f"📊 Organoid {organoid_idx} has {organoid_volume.shape[0]} z-slices")
+                
+            elif storage_type == 'variable_size_groups':
+                # SIMPLE OPTIMIZED FORMAT: Variable-size groups in single zarr
+                organoid_key = f"organoid_{organoid_idx:04d}"
+                
+                if organoid_key not in bundle:
+                    available_organoids = len([k for k in bundle.keys() if k.startswith('organoid_')])
+                    print(f"❌ Organoid index {organoid_idx} not found (only {available_organoids} organoids available)")
+                    return None
+                
+                organoid_group = bundle[organoid_key]
+                organoid_data = organoid_group['data'][:]  # Shape: (c, z, y, x)
+                organoid_volume = organoid_data[channel]  # Shape: (z, y, x)
+                
+                print(f"📊 Organoid volume shape: {organoid_volume.shape} (simple optimized format)")
+                print(f"📊 Organoid {organoid_idx} has {organoid_volume.shape[0]} z-slices")
+                
+            else:
+                # OLD FORMAT: Uniform padding in single zarr
+                # Check if the specified level exists
+                if str(level) in bundle:
+                    data = bundle[str(level)]
+                else:
+                    # Fall back to main data array
+                    data = bundle['data']
+                
+                if organoid_idx >= data.shape[0]:
+                    print(f"❌ Organoid index {organoid_idx} not found (only {data.shape[0]} organoids available)")
+                    return None
+                
+                # Get the specific organoid's 3D volume for the specified channel
+                # Data shape: (n_organoids, n_channels, z, y, x)
+                organoid_volume = data[organoid_idx, channel]  # Shape: (z, y, x)
+                print(f"📊 Organoid volume shape: {organoid_volume.shape} (legacy format)")
+                print(f"📊 Organoid {organoid_idx} has {organoid_volume.shape[0]} z-slices")
+            
+            n_z = organoid_volume.shape[0]
+            
+            print(f"📊 Organoid {organoid_idx} has {n_z} z-slices")
+            
+            # Determine which z-slices to show
+            if z_slices is None:
+                # Show all z-slices
+                z_indices = list(range(n_z))
+                title_suffix = f"All {n_z} Z-slices"
+            elif z_slices == 3:
+                # Show top, middle, bottom
+                z_indices = [0, n_z // 2, n_z - 1]
+                title_suffix = "Top, Middle, Bottom Z-slices"
+            else:
+                # Show evenly spaced slices including top and bottom
+                if z_slices >= n_z:
+                    z_indices = list(range(n_z))
+                    title_suffix = f"All {n_z} Z-slices"
+                else:
+                    z_indices = np.linspace(0, n_z - 1, z_slices, dtype=int).tolist()
+                    title_suffix = f"{z_slices} Evenly Spaced Z-slices"
+            
+            # Remove duplicates and sort
+            z_indices = sorted(list(set(z_indices)))
+            n_slices_to_show = len(z_indices)
+            
+            print(f"🎯 Showing z-slices: {z_indices}")
+            
+            # Calculate grid size
+            cols = min(4, n_slices_to_show)  # Max 4 columns
+            rows = (n_slices_to_show + cols - 1) // cols
+            
+            # Create the plot
+            fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+            
+            # Handle different subplot configurations
+            if n_slices_to_show == 1:
+                axes = [axes]  # Single subplot
+            elif rows == 1 and cols > 1:
+                # Single row, multiple columns - axes is already 1D
+                pass
+            elif rows > 1 and cols == 1:
+                # Multiple rows, single column - axes is already 1D
+                pass
+            else:
+                # Multiple rows and columns - axes is 2D, flatten it for easier indexing
+                axes = axes.flatten()
+            
+            # Plot each z-slice
+            for i, z_idx in enumerate(z_indices):
+                if n_slices_to_show == 1:
+                    ax = axes[0]
+                elif rows == 1 or cols == 1:
+                    ax = axes[i]
+                else:
+                    ax = axes[i]
+                
+                slice_img = organoid_volume[z_idx]
+                im = ax.imshow(slice_img, cmap='gray')
+                ax.set_title(f'Z={z_idx}', fontsize=10, fontweight='bold')
+                ax.axis('off')
+                
+                # Add colorbar
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            
+            # Hide unused subplots
+            total_subplots = rows * cols
+            for i in range(n_slices_to_show, total_subplots):
+                if n_slices_to_show == 1:
+                    break  # No unused subplots
+                elif rows == 1 or cols == 1:
+                    axes[i].axis('off')
+                else:
+                    axes[i].axis('off')
+            
+            fig.suptitle(f'{condition} - Organoid {organoid_idx} - CH{channel+1} - {title_suffix}', 
+                        fontsize=12, fontweight='bold')
+            plt.tight_layout()
+            
+            # Save if requested
+            saved_path = None
+            if save_png:
+                slice_str = "all" if z_slices is None else str(z_slices)
+                filename = f"{condition}_organoid{organoid_idx}_ch{channel+1}_z{slice_str}.png"
+                saved_path = condition_dir / filename
+                fig.savefig(saved_path, dpi=150, bbox_inches='tight')
+                print(f"💾 Saved: {saved_path}")
+            
+            if show_plot:
+                plt.show()
+            else:
+                plt.close(fig)
+                
+        except Exception as e:
+            print(f"❌ Error creating z-slice visualization: {e}")
+            return None
+            
         return saved_path
 
 class ZarrAnalyzer:
