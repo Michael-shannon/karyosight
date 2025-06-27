@@ -6,7 +6,8 @@ from pathlib import Path
 # MASTER = Path(r"D:\Lungbud_testsetmaster")  # master directory
 # MASTER = Path(r"O:\mshannon\2025\May\Lungbud_MASTER")  # master directory
 # MASTER = Path(r"D:\LUNGBUD_master")
-MASTER = Path(r"D:\LB_TEST")
+MASTER = Path(r"O:\mshannon\2025\May\LUNGBUD_master2")
+# MASTER = Path(r"D:\LB_TEST")
 # MASTER = Path(r"D:\LUNGBUD_OIRTEST")  # master directory
 
 # RAW_DIR         = Path(r"D:\LUNGBUDMASTERTEST_3") / "analyze"

@@ -20,6 +20,7 @@ import napari
 from pathlib import Path
 from karyosight.config import CROPPED_DIR, CONDITION_PREF
 from scipy import ndimage
+from tqdm import tqdm
 
 # import karyosight.config as cfg
 
@@ -66,7 +67,8 @@ class Cropper:
                                 pad_pct: float = 0.6,
                                 pad_step: float = 0.05,
                                 visualize: bool = False,
-                                verbose:   bool = False,
+                                verbose: bool = False,
+                                progress_bar: bool = None,
                                 filter_edge_cropped: bool = None):
         """
         Segment level `self.low_level` to find centroids + padded bboxes,
@@ -74,9 +76,18 @@ class Cropper:
         
         Parameters
         ----------
+        progress_bar : bool, optional
+            Whether to show progress bar. If None, toggles opposite of verbose.
+            When True, verbose output is suppressed and progress bar is shown.
         filter_edge_cropped : bool, optional
             Whether to filter out edge-cropped organoids. If None, uses config.FILTER_EDGE_CROPPED
         """
+        # Handle progress_bar/verbose toggle
+        if progress_bar is None:
+            progress_bar = not verbose
+        elif progress_bar and verbose:
+            verbose = False  # Suppress verbose when progress bar is active
+        
         # Import config here to avoid circular imports
         from karyosight.config import (FILTER_EDGE_CROPPED, EDGE_PROXIMITY_THRESHOLD, 
                                       STRAIGHT_EDGE_THRESHOLD, BLACK_REGION_THRESHOLD)
@@ -147,6 +158,7 @@ class Cropper:
 
         # 5) shrink to avoid overlapping any other organoid mask bbox
         final_rois = []
+        
         for p in big_props:
             pad = pad_pct
             if verbose:
@@ -299,7 +311,8 @@ class Cropper:
                              black_frame_method: str = 'intensity_threshold',
                              min_z_slices: int = 3,
                              uniform_padding: bool = False,
-                             save_only_level0: bool = True):
+                             save_only_level0: bool = True,
+                             progress_bar: bool = True):
         """
         Upscale ROIs, crop full-res, optionally pad to uniform size, and bundle into one Zarr.
         If a bundled zarr already exists for this condition, append new ROIs to it.
@@ -336,6 +349,8 @@ class Cropper:
         save_only_level0 : bool, optional
             If True, only save level 0 (highest resolution) data to save space and time.
             If False, save all pyramid levels (legacy behavior).
+        progress_bar : bool, optional
+            Whether to show progress bar during processing. Default True.
         """
         # 1) Determine how much RAM we can use for a *single* ROI uncompressed
         if memory_limit_bytes is None:
@@ -363,17 +378,20 @@ class Cropper:
         existing_n_rois = 0
         
         if out_grp.exists():
-            print(f"📂 Found existing bundled zarr at {out_grp}")
+            if not progress_bar:
+                print(f"📂 Found existing bundled zarr at {out_grp}")
             try:
                 existing_bundle = zarr.open_group(str(out_grp), mode='r')
                 existing_data = existing_bundle['data']
                 existing_n_rois = existing_data.shape[0]
                 existing_centroids = existing_bundle['centroids_lowres'][:]
                 existing_bboxes = existing_bundle['bboxes_highres'][:]
-                print(f"   → Found {existing_n_rois} existing ROIs")
+                if not progress_bar:
+                    print(f"   → Found {existing_n_rois} existing ROIs")
             except Exception as e:
-                print(f"   ⚠️ Error reading existing zarr: {e}")
-                print(f"   → Removing corrupted zarr and starting fresh")
+                if not progress_bar:
+                    print(f"   ⚠️ Error reading existing zarr: {e}")
+                    print(f"   → Removing corrupted zarr and starting fresh")
                 shutil.rmtree(out_grp)
                 existing_data = None
         
@@ -385,9 +403,10 @@ class Cropper:
         arr_high = root[str(self.high_level)]
         dtype    = arr_high.dtype
         
-        print(f"🎯 Save only level 0: {save_only_level0}")
-        if save_only_level0:
-            print(f"   → Will save only level {self.high_level} (highest resolution) to optimize speed/storage")
+        if not progress_bar:
+            print(f"🎯 Save only level 0: {save_only_level0}")
+            if save_only_level0:
+                print(f"   → Will save only level {self.high_level} (highest resolution) to optimize speed/storage")
 
         # 5) Compute the scale factors (low→high)
         sy = arr_high.shape[-2] / arr_low.shape[-2]
@@ -399,9 +418,10 @@ class Cropper:
         Wmax = 0
         roi_scaled_info = []
         
-        print(f"🎯 Uniform padding: {uniform_padding}")
-        if not uniform_padding:
-            print(f"   → Using variable-size storage (no padding) for maximum efficiency")
+        if not progress_bar:
+            print(f"🎯 Uniform padding: {uniform_padding}")
+            if not uniform_padding:
+                print(f"   → Using variable-size storage (no padding) for maximum efficiency")
 
         for i, roi in enumerate(rois):
             r0, c0, r1, c1 = roi['bbox']
@@ -427,7 +447,8 @@ class Cropper:
             # uncompressed bytes for one ROI slice:
             # dtype.itemsize × c_count × z_count × high_h × high_w
             bytes_for_this_roi = dtype.itemsize * c_count * z_count * high_h * high_w
-            print(f"→ Trying ROI #{i}: high‐res shape = (c={c_count}, z={z_count}, y={high_h}, x={high_w}) → {bytes_for_this_roi/1e9:.2f} GB")
+            if not progress_bar:
+                print(f"→ Trying ROI #{i}: high‐res shape = (c={c_count}, z={z_count}, y={high_h}, x={high_w}) → {bytes_for_this_roi/1e9:.2f} GB")
 
             if bytes_for_this_roi > memory_limit_bytes:
                 raise MemoryError(
@@ -462,7 +483,8 @@ class Cropper:
         if z_extraction_mode == 'peak':
             # Use fixed z-dimension based on slices around peak
             final_z_count = 2 * z_slices_around_peak + 1
-            print(f"🎯 Using peak intensity mode: {final_z_count} z-slices ({z_slices_around_peak} above/below peak)")
+            if not progress_bar:
+                print(f"🎯 Using peak intensity mode: {final_z_count} z-slices ({z_slices_around_peak} above/below peak)")
         else:
             final_z_count = z_count
         
@@ -482,9 +504,10 @@ class Cropper:
             final_Hmax = max(Hmax, existing_Hmax)
             final_Wmax = max(Wmax, existing_Wmax)
             
-            print(f"   → Existing dims: (c={existing_c}, z={existing_z}, y={existing_Hmax}, x={existing_Wmax})")
-            print(f"   → New dims: (c={c_count}, z={final_z_count}, y={Hmax}, x={Wmax})")
-            print(f"   → Final dims: (c={final_c}, z={final_z}, y={final_Hmax}, x={final_Wmax})")
+            if not progress_bar:
+                print(f"   → Existing dims: (c={existing_c}, z={existing_z}, y={existing_Hmax}, x={existing_Wmax})")
+                print(f"   → New dims: (c={c_count}, z={final_z_count}, y={Hmax}, x={Wmax})")
+                print(f"   → Final dims: (c={final_c}, z={final_z}, y={final_Hmax}, x={final_Wmax})")
             
             c_count, z_count, Hmax, Wmax = final_c, final_z, final_Hmax, final_Wmax
         else:
@@ -501,7 +524,8 @@ class Cropper:
 
         desired_chunks = (1,) + chunk_tuple  # one ROI at a time
 
-        print(f"📊 Creating bundled zarr with {total_n_rois} total ROIs ({existing_n_rois} existing + {n_new_rois} new)")
+        if not progress_bar:
+            print(f"📊 Creating bundled zarr with {total_n_rois} total ROIs ({existing_n_rois} existing + {n_new_rois} new)")
         
         # 8) Create new zarr with combined size
         # First create a temporary path
@@ -520,12 +544,14 @@ class Cropper:
         
         # 9) Copy existing data if any (with padding/cropping if needed)
         if existing_data is not None:
-            print(f"   → Copying {existing_n_rois} existing ROIs...")
+            if not progress_bar:
+                print(f"   → Copying {existing_n_rois} existing ROIs...")
             for i in range(existing_n_rois):
                 existing_roi = existing_data[i]  # Shape: (c, z, y, x)
                 target_shape = (c_count, z_count, Hmax, Wmax)
                 
-                print(f"   → ROI {i}: existing shape {existing_roi.shape} → target shape {target_shape}")
+                if not progress_bar:
+                    print(f"   → ROI {i}: existing shape {existing_roi.shape} → target shape {target_shape}")
                 
                 # Handle dimensions - special processing for peak mode z-dimension
                 processed_roi = existing_roi
@@ -542,7 +568,8 @@ class Cropper:
                     
                     # Extract z-range for all channels
                     processed_roi = processed_roi[:, z_start:z_end, :, :]
-                    print(f"     → Existing ROI peak at z={peak_z}, extracted z={z_start}:{z_end}")
+                    if not progress_bar:
+                        print(f"     → Existing ROI peak at z={peak_z}, extracted z={z_start}:{z_end}")
                 
                 # Apply black frame removal to existing data if requested
                 if remove_black_frames and processed_roi.shape[1] > min_z_slices:
@@ -552,9 +579,9 @@ class Cropper:
                         threshold_pct=black_frame_threshold,
                         method=black_frame_method, 
                         min_slices=min_z_slices,
-                        verbose=True
+                        verbose=not progress_bar
                     )
-                    if processed_roi.shape[1] != original_z:
+                    if processed_roi.shape[1] != original_z and not progress_bar:
                         print(f"     → Existing ROI black frame removal: {original_z} → {processed_roi.shape[1]} z-slices")
                 
                 # Handle remaining dimensions - pad or crop as needed
@@ -569,18 +596,25 @@ class Cropper:
                             pad_spec = [(0, 0)] * processed_roi.ndim
                             pad_spec[dim] = (0, pad_amount)
                             processed_roi = np.pad(processed_roi, pad_spec, mode='constant', constant_values=0)
-                            print(f"     → Padded dim {dim} from {current_size} to {target_size}")
+                            if not progress_bar:
+                                print(f"     → Padded dim {dim} from {current_size} to {target_size}")
                         else:
                             # Need to crop this dimension
                             slice_spec = [slice(None)] * processed_roi.ndim
                             slice_spec[dim] = slice(0, target_size)
                             processed_roi = processed_roi[tuple(slice_spec)]
-                            print(f"     → Cropped dim {dim} from {current_size} to {target_size}")
+                            if not progress_bar:
+                                print(f"     → Cropped dim {dim} from {current_size} to {target_size}")
                 
                 outz['data'][i, ...] = processed_roi
 
         # 10) Process and write new ROIs starting from index existing_n_rois
-        for i, info in enumerate(roi_scaled_info):
+        roi_iterator = tqdm(enumerate(roi_scaled_info), 
+                           desc=f"Processing {cond}", 
+                           total=len(roi_scaled_info),
+                           disable=not progress_bar) if progress_bar else enumerate(roi_scaled_info)
+        
+        for i, info in roi_iterator:
             zarr_index = existing_n_rois + i
             hr0, hc0, hr1, hc1 = info['high_bbox']
 
@@ -635,7 +669,8 @@ class Cropper:
                     extracted_subvol = np.pad(extracted_subvol, z_pad_spec, mode='constant', constant_values=0)
                 
                 subvol = extracted_subvol
-                print(f"     → Peak at z={peak_z}, extracted z={z_start}:{z_end} ({subvol.shape[1]} slices)")
+                if not progress_bar:
+                    print(f"     → Peak at z={peak_z}, extracted z={z_start}:{z_end} ({subvol.shape[1]} slices)")
             
             # Remove black frames if requested (after z-extraction but before spatial padding)
             if remove_black_frames and subvol.shape[1] > min_z_slices:
@@ -645,9 +680,9 @@ class Cropper:
                     threshold_pct=black_frame_threshold,
                     method=black_frame_method,
                     min_slices=min_z_slices,
-                    verbose=True
+                    verbose=not progress_bar
                 )
-                if subvol.shape[1] != original_z_count:
+                if subvol.shape[1] != original_z_count and not progress_bar:
                     print(f"     → Black frame removal: {original_z_count} → {subvol.shape[1]} z-slices")
 
             # Pad spatial dimensions to (c_count, z_count, Hmax, Wmax)
@@ -696,7 +731,8 @@ class Cropper:
             shutil.rmtree(out_grp)
         temp_grp.rename(out_grp)
         
-        print(f"✅ Successfully bundled {total_n_rois} ROIs for {cond}")
+        if not progress_bar:
+            print(f"✅ Successfully bundled {total_n_rois} ROIs for {cond}")
         return out_grp
 
     def bundle_and_save_rois_simple_optimized(self,
@@ -709,7 +745,8 @@ class Cropper:
                                               remove_black_frames: bool = False,
                                               black_frame_threshold: float = 0.001,
                                               black_frame_method: str = 'intensity_threshold',
-                                              min_z_slices: int = 3):
+                                              min_z_slices: int = 3,
+                                              progress_bar: bool = True):
         """
         SIMPLE OPTIMIZED version: Single bundled zarr but NO PADDING.
         Each organoid stored with its original dimensions using zarr groups.
@@ -723,11 +760,17 @@ class Cropper:
         - NO JSON: Uses zarr attributes for metadata
         - FASTER: No padding computations
         - RESUMABLE: Skips existing organoids
+        
+        Parameters
+        ----------
+        progress_bar : bool, optional
+            Whether to show progress bar during processing. Default True.
         """
         
-        print(f"🚀 SIMPLE OPTIMIZED CROPPING: Single zarr, no padding")
-        print(f"   → Z-mode: {z_extraction_mode}")
-        print(f"   → Black frame removal: {remove_black_frames}")
+        if not progress_bar:
+            print(f"🚀 SIMPLE OPTIMIZED CROPPING: Single zarr, no padding")
+            print(f"   → Z-mode: {z_extraction_mode}")
+            print(f"   → Black frame removal: {remove_black_frames}")
         
         # 1) Memory and path setup
         if memory_limit_bytes is None:
@@ -751,7 +794,8 @@ class Cropper:
         if out_grp.exists():
             bundle_group = zarr.open_group(str(out_grp), mode='r+')
             existing_count = len([k for k in bundle_group.keys() if k.startswith('organoid_')])
-            print(f"📂 Found existing bundle with {existing_count} organoids")
+            if not progress_bar:
+                print(f"📂 Found existing bundle with {existing_count} organoids")
         else:
             bundle_group = zarr.open_group(str(out_grp), mode='w')
             existing_count = 0
@@ -769,17 +813,24 @@ class Cropper:
         
         if z_extraction_mode == 'peak':
             target_z_slices = 2 * z_slices_around_peak + 1
-            print(f"🎯 Peak mode: {target_z_slices} z-slices ({z_slices_around_peak} above/below)")
+            if not progress_bar:
+                print(f"🎯 Peak mode: {target_z_slices} z-slices ({z_slices_around_peak} above/below)")
         
         # 4) Process each ROI
         processed_count = 0
-        for i, roi in enumerate(rois):
+        roi_iterator = tqdm(enumerate(rois), 
+                           desc=f"Processing {cond}", 
+                           total=len(rois),
+                           disable=not progress_bar) if progress_bar else enumerate(rois)
+        
+        for i, roi in roi_iterator:
             organoid_idx = existing_count + i
             organoid_key = f"organoid_{organoid_idx:04d}"
             
             # Skip if already exists
             if organoid_key in bundle_group:
-                print(f"   ⏭️  Skipping existing {organoid_key}")
+                if not progress_bar:
+                    print(f"   ⏭️  Skipping existing {organoid_key}")
                 continue
             
             try:
@@ -808,10 +859,12 @@ class Cropper:
                         organoid_group.attrs[key] = value
                     
                     processed_count += 1
-                    print(f"   ✅ {organoid_key}: {organoid_data.shape}")
+                    if not progress_bar:
+                        print(f"   ✅ {organoid_key}: {organoid_data.shape}")
                 
             except Exception as e:
-                print(f"   ❌ Error processing {organoid_key}: {e}")
+                if not progress_bar:
+                    print(f"   ❌ Error processing {organoid_key}: {e}")
                 continue
         
         # 5) Update bundle metadata
@@ -819,10 +872,11 @@ class Cropper:
         from datetime import datetime
         bundle_group.attrs['last_updated'] = str(datetime.now())
         
-        print(f"🏁 Simple optimized processing complete!")
-        print(f"   → Total organoids: {existing_count + processed_count}")
-        print(f"   → New organoids: {processed_count}")
-        print(f"   → Bundle: {out_grp}")
+        if not progress_bar:
+            print(f"🏁 Simple optimized processing complete!")
+            print(f"   → Total organoids: {existing_count + processed_count}")
+            print(f"   → New organoids: {processed_count}")
+            print(f"   → Bundle: {out_grp}")
         
         return out_grp
     
