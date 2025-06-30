@@ -42,13 +42,13 @@ from pathlib import Path
 
 # PyImageJ
 
-import imagej
+# import imagej
 # import scyjava as sj
 
-import scyjava
+# import scyjava
 
 # Tell the JVM to open java.lang to unnamed modules (required on newer Java)
-scyjava.config.add_option("--add-opens=java.base/java.lang=ALL-UNNAMED")
+# scyjava.config.add_option("--add-opens=java.base/java.lang=ALL-UNNAMED") #disabled honestly
 
 # Initialize once (in headless or interactive mode as you prefer)
 # IJ = imagej.init('sc.fiji:fiji', mode='headless')

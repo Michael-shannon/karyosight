@@ -21,6 +21,7 @@ from pathlib import Path
 from karyosight.config import CROPPED_DIR, CONDITION_PREF
 from scipy import ndimage
 from tqdm import tqdm
+import tifffile
 
 # import karyosight.config as cfg
 
@@ -845,6 +846,7 @@ class Cropper:
                 if organoid_data is not None:
                     # Store in zarr group with original dimensions (NO PADDING!)
                     organoid_group = bundle_group.create_group(organoid_key)
+                    # from numcodecs import Blosc # alright, this is suggested if you need to use Blosc directly
                     organoid_group.create_dataset(
                         'data',
                         data=organoid_data,
@@ -852,6 +854,7 @@ class Cropper:
                                min(organoid_data.shape[2], 256), 
                                min(organoid_data.shape[3], 256)),
                         compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=zarr.Blosc.SHUFFLE)
+                        # compressor=Blosc(cname='zstd', clevel=3, shuffle=Blosc.SHUFFLE)
                     )
                     
                     # Store metadata as attributes
@@ -1230,3 +1233,137 @@ class Cropper:
             straight_pixels += np.sum(distances <= line_tolerance)
             
         return straight_pixels / len(boundary_coords) if len(boundary_coords) > 0 else 0.0
+
+    @staticmethod
+    def zarr_to_tiff_stack(zarr_path: Path, 
+                          output_path: Path = None,
+                          roi_index: int = 0,
+                          channel: int = 0,
+                          level: int = 0,
+                          compress: bool = True,
+                          verbose: bool = True) -> Path:
+        """
+        Convert a zarr file from the cropped folder to a TIFF stack.
+        
+        Parameters
+        ----------
+        zarr_path : Path
+            Path to the input zarr file
+        output_path : Path, optional
+            Path for the output TIFF file. If None, uses the same name as zarr with .tif extension
+        roi_index : int, default 0
+            ROI index to extract (for bundled zarr files with multiple ROIs)
+        channel : int, default 0
+            Channel index to extract
+        level : int, default 0
+            Resolution level to extract (0 = highest resolution)
+        compress : bool, default True
+            Whether to use compression for the TIFF file
+        verbose : bool, default True
+            Whether to print progress information
+            
+        Returns
+        -------
+        Path
+            Path to the saved TIFF file
+        """
+        zarr_path = Path(zarr_path)
+        
+        if output_path is None:
+            output_path = zarr_path.with_suffix('.tif')
+        else:
+            output_path = Path(output_path)
+            
+        if verbose:
+            print(f"🔄 Converting zarr to TIFF stack...")
+            print(f"   Input:  {zarr_path}")
+            print(f"   Output: {output_path}")
+        
+        try:
+            # Open zarr file
+            root = zarr.open_group(str(zarr_path), mode='r')
+            
+            # Handle different zarr structures
+            if str(level) in root:
+                # Multi-resolution zarr (stitched)
+                arr = root[str(level)]
+                if verbose:
+                    print(f"   Using resolution level {level}, shape: {arr.shape}")
+                
+                # Assume format is (t, c, z, y, x)
+                if len(arr.shape) == 5:
+                    data = arr[0, channel, :, :, :]  # Extract first timepoint and specified channel
+                elif len(arr.shape) == 4:
+                    # Format might be (c, z, y, x)
+                    data = arr[channel, :, :, :]
+                elif len(arr.shape) == 3:
+                    # Format might be (z, y, x)
+                    data = arr[:, :, :]
+                else:
+                    raise ValueError(f"Unexpected array shape: {arr.shape}")
+                    
+            elif 'data' in root:
+                # Bundled ROI zarr
+                data_group = root['data']
+                if f'roi_{roi_index}' in data_group:
+                    roi_data = data_group[f'roi_{roi_index}']
+                    if verbose:
+                        print(f"   Using ROI {roi_index}, shape: {roi_data.shape}")
+                    
+                    # Assume format is (c, z, y, x)
+                    if len(roi_data.shape) == 4:
+                        data = roi_data[channel, :, :, :]
+                    elif len(roi_data.shape) == 3:
+                        data = roi_data[:, :, :]
+                    else:
+                        raise ValueError(f"Unexpected ROI shape: {roi_data.shape}")
+                else:
+                    raise ValueError(f"ROI {roi_index} not found in zarr file")
+            else:
+                # Try to read directly as array
+                try:
+                    arr = root[:]
+                    if verbose:
+                        print(f"   Reading direct array, shape: {arr.shape}")
+                    
+                    if len(arr.shape) == 5:
+                        data = arr[0, channel, :, :, :]
+                    elif len(arr.shape) == 4:
+                        data = arr[channel, :, :, :]
+                    elif len(arr.shape) == 3:
+                        data = arr[:, :, :]
+                    else:
+                        raise ValueError(f"Unexpected array shape: {arr.shape}")
+                except:
+                    raise ValueError("Unable to determine zarr structure")
+            
+            # Convert to numpy array if it's a dask array
+            if hasattr(data, 'compute'):
+                if verbose:
+                    print("   Converting dask array to numpy...")
+                data = data.compute()
+            elif not isinstance(data, np.ndarray):
+                data = np.array(data)
+            
+            if verbose:
+                print(f"   Final data shape: {data.shape}")
+                print(f"   Data type: {data.dtype}")
+                print(f"   Value range: {data.min():.0f} - {data.max():.0f}")
+            
+            # Save as TIFF stack
+            compression = 'zlib' if compress else None
+            tifffile.imwrite(
+                str(output_path), 
+                data,
+                compression=compression,
+                metadata={'axes': 'ZYX'}
+            )
+            
+            if verbose:
+                print(f"✅ Successfully saved TIFF stack: {output_path}")
+                
+            return output_path
+            
+        except Exception as e:
+            print(f"❌ Error converting zarr to TIFF: {e}")
+            raise
