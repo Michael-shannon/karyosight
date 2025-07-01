@@ -307,6 +307,30 @@ class NucleiSegmenterSAM:
                     'size_filtering_applied': False,
                     'min_nuclei_size': None
                 }
+                
+            # Apply post-segmentation z-slice optimization if enabled
+            z_optimization_metadata = {}
+            if CONFIG_AVAILABLE and ENABLE_Z_SLICE_OPTIMIZATION:
+                if verbose:
+                    print(f"✂️ Applying post-segmentation z-slice optimization...")
+                
+                optimized_image, optimized_masks, z_opt_meta = optimize_z_slices_after_segmentation(
+                    image, masks,
+                    strategy=Z_OPTIMIZATION_STRATEGY,
+                    padding=Z_OPTIMIZATION_PADDING,
+                    verbose=verbose
+                )
+                
+                # Update image and masks if optimization was applied
+                if z_opt_meta['z_optimization_applied']:
+                    image = optimized_image  # For consistency in metadata
+                    masks = optimized_masks
+                    
+                    if verbose:
+                        compression = z_opt_meta['compression_ratio_percent']
+                        print(f"      ✅ Z-slice optimization: {compression:.1f}% reduction")
+                
+                z_optimization_metadata = z_opt_meta
             
             processing_time = time.time() - start_time
             
@@ -319,7 +343,8 @@ class NucleiSegmenterSAM:
                 'model_type': 'cpsam',
                 'gpu_used': self.use_gpu and self._gpu_available,
                 'image_shape': image.shape,
-                **filter_metadata  # Include size filtering metadata
+                **filter_metadata,  # Include size filtering metadata
+                **z_optimization_metadata  # Include z-slice optimization metadata
             }
             
             if verbose:
@@ -569,9 +594,38 @@ class NucleiSegmenterSAM:
                 # Run cellpose-SAM segmentation
                 masks, metadata = self.segment_organoid(img, params, verbose=False)
                 
-                # Count nuclei
-                n_nuclei = metadata['num_cells']
-                total_nuclei += n_nuclei
+                # Store results with original raw data for incremental saving
+                segmentation_results[org_idx] = {
+                    'masks': masks,
+                    'metadata': metadata,
+                    'organoid_key': org_key,
+                    'original_raw_data': organoid_data,  # Include for incremental saving
+                    'success': True
+                }
+                
+                # 💾 INCREMENTAL SAVE: Save this organoid immediately to prevent data loss
+                try:
+                    from karyosight.config import SEGMENTED_DIR
+                    segmented_dir = Path(SEGMENTED_DIR)
+                except:
+                    segmented_dir = Path("D:/LB_TEST/segmented")
+                
+                save_success = save_single_organoid_segmented(
+                    segmentation_results[org_idx],
+                    condition_name,
+                    segmented_dir,
+                    verbose=verbose
+                )
+                
+                if save_success:
+                    segmentation_results[org_idx]['saved_incrementally'] = True
+                else:
+                    segmentation_results[org_idx]['saved_incrementally'] = False
+                    if verbose:
+                        print(f"         ⚠️  Failed to save organoid {org_idx} incrementally")
+                
+                nuclei_count = metadata['num_cells']
+                total_nuclei += nuclei_count
                 
                 # Create organoid group in output
                 if organoid_key in output_bundle:
@@ -1164,6 +1218,7 @@ def open_parameter_testing_in_napari(segmenter: 'NucleiSegmenterSAM'):
 def check_existing_segmentation(zarr_path: Path) -> Dict[str, Any]:
     """
     Check which organoids already have segmentation masks for resume capability
+    Checks both cropped directory (legacy) and segmented directory (incremental saves)
     
     Args:
         zarr_path: Path to bundled zarr file
@@ -1186,22 +1241,44 @@ def check_existing_segmentation(zarr_path: Path) -> Dict[str, Any]:
             organoid_indices = list(range(n_organoids))
             organoid_keys = [f"organoid_{i:04d}" for i in organoid_indices]
         
-        # Check which have segmentation masks
+        # Check which have segmentation masks (legacy cropped directory)
         existing_segmentation = {}
         for org_idx, org_key in zip(organoid_indices, organoid_keys):
             has_masks = False
             n_nuclei = 0
+            save_location = 'none'
             
+            # Check legacy location first (cropped directory)
             if hasattr(bundle, 'keys') and org_key in bundle:
                 organoid_group = bundle[org_key]
                 if 'masks' in organoid_group:
                     has_masks = True
                     n_nuclei = organoid_group.attrs.get('n_nuclei', 0)
+                    save_location = 'cropped'
+            
+            # Check new incremental save location (segmented directory)
+            if not has_masks:
+                try:
+                    from karyosight.config import SEGMENTED_DIR
+                    segmented_dir = Path(SEGMENTED_DIR)
+                    segmented_zarr = segmented_dir / condition_name / f"{condition_name}_segmented.zarr"
+                    
+                    if segmented_zarr.exists():
+                        seg_bundle = zarr.open_group(str(segmented_zarr), mode='r')
+                        if org_key in seg_bundle:
+                            seg_organoid_group = seg_bundle[org_key]
+                            if 'masks' in seg_organoid_group:
+                                has_masks = True
+                                n_nuclei = seg_organoid_group.attrs.get('n_nuclei', 0)
+                                save_location = 'segmented'
+                except:
+                    pass  # Failed to check segmented directory, continue
             
             existing_segmentation[org_idx] = {
                 'has_masks': has_masks,
                 'n_nuclei': n_nuclei,
-                'organoid_key': org_key
+                'organoid_key': org_key,
+                'save_location': save_location
             }
         
         existing_count = sum(1 for v in existing_segmentation.values() if v['has_masks'])
@@ -1224,6 +1301,317 @@ def check_existing_segmentation(zarr_path: Path) -> Dict[str, Any]:
             'completion_percentage': 0,
             'error': str(e)
         }
+
+def save_single_organoid_segmented(
+    organoid_result: Dict[str, Any],
+    condition_name: str,
+    segmented_dir: Path,
+    verbose: bool = False
+) -> bool:
+    """
+    Save a single organoid's segmentation results incrementally to segmented directory
+    
+    Args:
+        organoid_result: Single organoid segmentation result
+        condition_name: Name of the condition
+        segmented_dir: Directory to save segmented results
+        verbose: Print detailed information
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not organoid_result['success']:
+        return False
+    
+    try:
+        # Create segmented directory structure
+        condition_segmented_dir = segmented_dir / condition_name
+        condition_segmented_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create or open output zarr file
+        output_zarr_path = condition_segmented_dir / f"{condition_name}_segmented.zarr"
+        
+        # Open or create zarr bundle
+        if output_zarr_path.exists():
+            output_bundle = zarr.open_group(str(output_zarr_path), mode='r+')
+        else:
+            output_bundle = zarr.open_group(str(output_zarr_path), mode='w')
+            # Initialize bundle metadata
+            output_bundle.attrs['condition'] = condition_name
+            output_bundle.attrs['creation_timestamp'] = str(time.time())
+            output_bundle.attrs['segmentation_params'] = {
+                'model_type': 'cpsam',
+                'z_optimization_applied': True,
+                'incremental_save': True
+            }
+        
+        # Get organoid data
+        org_key = organoid_result['organoid_key']
+        masks = organoid_result['masks']
+        metadata = organoid_result['metadata']
+        
+        # Load original raw data to apply z-optimization
+        if 'original_raw_data' in organoid_result:
+            # Raw data was included in result
+            original_raw_data = organoid_result['original_raw_data']
+        else:
+            # Need to load from source - this is a fallback, should be avoided
+            if verbose:
+                print(f"      ⚠️  Loading original data for z-optimization (slower)")
+            return False  # Skip for now - we'll include raw data in results
+        
+        # Apply z-optimization to raw data if it was applied to masks
+        if metadata.get('z_optimization_applied', False):
+            z_slices_kept = metadata.get('z_slices_kept', None)
+            if z_slices_kept is not None:
+                optimized_raw_data = original_raw_data[:, z_slices_kept, :, :]  # [C, Z, Y, X]
+                optimized_masks = masks  # Already optimized
+            else:
+                optimized_raw_data = original_raw_data
+                optimized_masks = masks
+        else:
+            optimized_raw_data = original_raw_data
+            optimized_masks = masks
+        
+        # Create organoid group in output (overwrite if exists)
+        if org_key in output_bundle:
+            del output_bundle[org_key]
+        
+        organoid_group = output_bundle.create_group(org_key)
+        
+        # Save optimized raw data with compression
+        organoid_group.create_dataset(
+            'data',
+            data=optimized_raw_data.astype(np.uint16),
+            chunks=(1, min(optimized_raw_data.shape[1], 32), 
+                   min(optimized_raw_data.shape[2], 256), 
+                   min(optimized_raw_data.shape[3], 256)),
+            dtype=np.uint16
+        )
+        
+        # Save optimized masks with compression
+        masks_uint16 = optimized_masks.astype(np.uint16)
+        organoid_group.create_dataset(
+            'masks',
+            data=masks_uint16,
+            chunks=(min(masks_uint16.shape[0], 32), 
+                   min(masks_uint16.shape[1], 256), 
+                   min(masks_uint16.shape[2], 256)),
+            dtype=np.uint16
+        )
+        
+        # Save comprehensive metadata
+        organoid_group.attrs.update({
+            'n_nuclei': metadata['num_cells'],
+            'num_cells': metadata['num_cells'],
+            'original_raw_shape': list(original_raw_data.shape),
+            'optimized_raw_shape': list(optimized_raw_data.shape),
+            'masks_shape': list(optimized_masks.shape),
+            'processing_time': metadata['processing_time'],
+            'model_type': 'cpsam',
+            'diameter': metadata['diameter'],
+            'anisotropy': metadata['anisotropy'],
+            'gpu_used': metadata['gpu_used'],
+            'z_optimization_applied': metadata.get('z_optimization_applied', False),
+            'compression_ratio_percent': metadata.get('compression_ratio_percent', 0),
+            'size_filtering_applied': metadata.get('size_filtering_applied', False),
+            'min_nuclei_size': metadata.get('min_nuclei_size', None),
+            'save_timestamp': str(time.time())
+        })
+        
+        if verbose:
+            org_idx = int(org_key.split('_')[1])
+            compression = metadata.get('compression_ratio_percent', 0)
+            print(f"      💾 Saved organoid {org_idx}: {metadata['num_cells']} nuclei, {compression:.1f}% compression")
+        
+        return True
+        
+    except Exception as e:
+        if verbose:
+            print(f"      ❌ Error saving organoid: {e}")
+        return False
+
+def save_segmented_zarr_optimized(
+    zarr_path: Path,
+    segmentation_results: Dict[str, Any],
+    segmented_dir: Path,
+    dry_run: bool = False,
+    verbose: bool = True
+) -> bool:
+    """
+    Save optimized segmentation results to new segmented directory
+    Saves both z-optimized raw data and z-optimized masks
+    
+    Args:
+        zarr_path: Path to original bundled zarr file
+        segmentation_results: Results from segmentation with z-optimization
+        segmented_dir: Directory to save segmented results
+        dry_run: If True, don't actually save files
+        verbose: Print detailed information
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    import datetime
+    
+    condition_name = zarr_path.parent.name
+    if verbose:
+        print(f"\n💾 Saving optimized segmentation to: segmented/{condition_name}")
+    
+    if dry_run:
+        successful_count = sum(1 for r in segmentation_results.values() if r['success'])
+        if verbose:
+            print(f"   🔍 DRY RUN: Would save {successful_count} optimized organoids")
+        return True
+    
+    save_start_time = time.time()
+    
+    try:
+        # Create segmented directory structure
+        condition_segmented_dir = segmented_dir / condition_name
+        condition_segmented_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create output zarr file
+        output_zarr_path = condition_segmented_dir / f"{condition_name}_segmented.zarr"
+        if output_zarr_path.exists():
+            import shutil
+            shutil.rmtree(output_zarr_path)
+        
+        output_bundle = zarr.open_group(str(output_zarr_path), mode='w')
+        
+        # Add metadata to bundle
+        output_bundle.attrs['condition'] = condition_name
+        output_bundle.attrs['creation_timestamp'] = str(datetime.datetime.now())
+        output_bundle.attrs['segmentation_params'] = {
+            'model_type': 'cpsam',
+            'z_optimization_applied': True,
+            'source_zarr': str(zarr_path)
+        }
+        
+        # Load original zarr for raw data
+        input_bundle = zarr.open_group(str(zarr_path), mode='r')
+        
+        # Process each successful segmentation
+        organoids_saved = 0
+        total_nuclei_saved = 0
+        total_compression = 0
+        
+        for org_idx, result in segmentation_results.items():
+            if not result['success']:
+                continue
+                
+            org_key = result['organoid_key']
+            masks = result['masks']
+            metadata = result['metadata']
+            
+            # Load original raw data for this organoid
+            if org_key in input_bundle:
+                original_organoid_data = input_bundle[org_key]['data'][:]
+                if hasattr(original_organoid_data, 'compute'):
+                    original_organoid_data = original_organoid_data.compute()
+                else:
+                    original_organoid_data = np.array(original_organoid_data)
+            else:
+                if verbose:
+                    print(f"      ⚠️  Could not load raw data for {org_key}")
+                continue
+            
+            # Apply z-optimization to both raw data and masks if it was applied
+            if metadata.get('z_optimization_applied', False):
+                # Extract the z-slices that were kept
+                z_slices_kept = metadata.get('z_slices_kept', None)
+                
+                if z_slices_kept is not None:
+                    # Apply same z-optimization to raw data
+                    optimized_raw_data = original_organoid_data[:, z_slices_kept, :, :]  # [C, Z, Y, X]
+                    optimized_masks = masks  # Already optimized during segmentation
+                    
+                    compression_ratio = metadata.get('compression_ratio_percent', 0)
+                    total_compression += compression_ratio
+                    
+                    if verbose:
+                        print(f"      ✅ Organoid {org_idx}: {original_organoid_data.shape[1]} → {optimized_raw_data.shape[1]} z-slices ({compression_ratio:.1f}% compression)")
+                else:
+                    # No z-optimization metadata, use original
+                    optimized_raw_data = original_organoid_data
+                    optimized_masks = masks
+            else:
+                # No z-optimization applied
+                optimized_raw_data = original_organoid_data
+                optimized_masks = masks
+            
+            # Create organoid group in output
+            organoid_group = output_bundle.create_group(org_key)
+            
+            # Save optimized raw data with compression
+            organoid_group.create_dataset(
+                'data',
+                data=optimized_raw_data.astype(np.uint16),
+                chunks=(1, min(optimized_raw_data.shape[1], 32), 
+                       min(optimized_raw_data.shape[2], 256), 
+                       min(optimized_raw_data.shape[3], 256)),
+                dtype=np.uint16
+            )
+            
+            # Save optimized masks with compression
+            masks_uint16 = optimized_masks.astype(np.uint16)
+            organoid_group.create_dataset(
+                'masks',
+                data=masks_uint16,
+                chunks=(min(masks_uint16.shape[0], 32), 
+                       min(masks_uint16.shape[1], 256), 
+                       min(masks_uint16.shape[2], 256)),
+                dtype=np.uint16
+            )
+            
+            # Save comprehensive metadata
+            organoid_group.attrs.update({
+                'n_nuclei': metadata['num_cells'],
+                'num_cells': metadata['num_cells'],
+                'original_raw_shape': list(original_organoid_data.shape),
+                'optimized_raw_shape': list(optimized_raw_data.shape),
+                'masks_shape': list(optimized_masks.shape),
+                'processing_time': metadata['processing_time'],
+                'model_type': 'cpsam',
+                'diameter': metadata['diameter'],
+                'anisotropy': metadata['anisotropy'],
+                'gpu_used': metadata['gpu_used'],
+                'z_optimization_applied': metadata.get('z_optimization_applied', False),
+                'compression_ratio_percent': metadata.get('compression_ratio_percent', 0),
+                'size_filtering_applied': metadata.get('size_filtering_applied', False),
+                'min_nuclei_size': metadata.get('min_nuclei_size', None)
+            })
+            
+            organoids_saved += 1
+            total_nuclei_saved += metadata['num_cells']
+            
+            if verbose:
+                print(f"      💾 Saved: raw data {optimized_raw_data.shape} + masks {optimized_masks.shape}")
+        
+        save_time = time.time() - save_start_time
+        avg_compression = total_compression / organoids_saved if organoids_saved > 0 else 0
+        
+        # Update bundle metadata
+        output_bundle.attrs['organoids_saved'] = organoids_saved
+        output_bundle.attrs['total_nuclei'] = total_nuclei_saved
+        output_bundle.attrs['average_compression_percent'] = avg_compression
+        output_bundle.attrs['save_time_seconds'] = save_time
+        
+        if verbose:
+            print(f"   ✅ Successfully saved segmented data:")
+            print(f"      → Output: {output_zarr_path}")
+            print(f"      → Organoids saved: {organoids_saved}")
+            print(f"      → Total nuclei: {total_nuclei_saved}")
+            print(f"      → Average compression: {avg_compression:.1f}%")
+            print(f"      → Save time: {save_time:.1f}s")
+            print(f"      → Contains: z-optimized raw data + z-optimized masks")
+        
+        return True
+        
+    except Exception as e:
+        if verbose:
+            print(f"   ❌ Error saving segmented data: {e}")
+        return False
 
 def add_segmentation_to_zarr_optimized(
     zarr_path: Path,
@@ -1405,7 +1793,17 @@ def segment_condition(
     
     if existing_status['existing_segmentation_count'] > 0:
         if verbose:
+            # Count save locations
+            cropped_count = sum(1 for v in existing_status['existing_segmentation'].values() 
+                              if v['save_location'] == 'cropped')
+            segmented_count = sum(1 for v in existing_status['existing_segmentation'].values() 
+                                if v['save_location'] == 'segmented')
+            
             print(f"   ✅ Found existing: {existing_status['existing_segmentation_count']}/{existing_status['total_organoids']} organoids ({existing_status['completion_percentage']:.1f}%)")
+            if cropped_count > 0:
+                print(f"      → In cropped directory: {cropped_count} organoids")
+            if segmented_count > 0:
+                print(f"      → In segmented directory: {segmented_count} organoids")
             if resume:
                 print(f"   🔄 Resume mode: Will skip organoids with existing segmentation")
             else:
@@ -1511,10 +1909,50 @@ def segment_condition(
             # Convert to numpy if needed
             if hasattr(img_3d, 'compute'):
                 img_3d = img_3d.compute()
+                organoid_data = organoid_data.compute()  # Also convert full data for saving
             else:
                 img_3d = np.array(img_3d)
+                organoid_data = np.array(organoid_data)
             
             data_load_time = time.time() - data_load_start
+            
+            # Apply focus filtering if enabled
+            focus_metadata = {}
+            if CONFIG_AVAILABLE and ENABLE_FOCUS_FILTERING:
+                focus_score = calculate_organoid_focus_score(img_3d, method=FOCUS_DETECTION_METHOD)
+                is_in_focus = focus_score >= MIN_FOCUS_SCORE
+                
+                focus_metadata = {
+                    'focus_filtering_applied': True,
+                    'focus_score': focus_score,
+                    'is_in_focus': is_in_focus,
+                    'focus_method': FOCUS_DETECTION_METHOD,
+                    'focus_threshold': MIN_FOCUS_SCORE
+                }
+                
+                if not is_in_focus:
+                    if verbose:
+                        print(f"         ⚠️  Skipping out-of-focus organoid (score={focus_score:.1f} < {MIN_FOCUS_SCORE})")
+                    
+                    # Store failed result
+                    segmentation_results[org_idx] = {
+                        'error': f'Out of focus (score={focus_score:.1f})',
+                        'organoid_key': org_key,
+                        'success': False,
+                        'focus_metadata': focus_metadata
+                    }
+                    continue
+            
+            # Apply z-slice filtering if enabled
+            z_filter_metadata = {}
+            if CONFIG_AVAILABLE and REMOVE_BLACK_FRAMES:
+                img_3d, z_filter_metadata = remove_black_z_slices(
+                    img_3d,
+                    threshold=BLACK_FRAME_THRESHOLD,
+                    method=BLACK_FRAME_METHOD,
+                    min_z_slices=MIN_Z_SLICES,
+                    verbose=False
+                )
             
             # Run segmentation
             seg_start = time.time()
@@ -1526,13 +1964,39 @@ def segment_condition(
             )
             seg_time = time.time() - seg_start
             
-            # Store results
+            # Add filtering metadata to segmentation results
+            metadata.update(focus_metadata)
+            metadata.update(z_filter_metadata)
+            
+            # Store results with original raw data for incremental saving
             segmentation_results[org_idx] = {
                 'masks': masks,
                 'metadata': metadata,
                 'organoid_key': org_key,
+                'original_raw_data': organoid_data,  # Include for incremental saving
                 'success': True
             }
+            
+            # 💾 INCREMENTAL SAVE: Save this organoid immediately to prevent data loss
+            try:
+                from karyosight.config import SEGMENTED_DIR
+                segmented_dir = Path(SEGMENTED_DIR)
+            except:
+                segmented_dir = Path("D:/LB_TEST/segmented")
+            
+            save_success = save_single_organoid_segmented(
+                segmentation_results[org_idx],
+                condition_name,
+                segmented_dir,
+                verbose=verbose
+            )
+            
+            if save_success:
+                segmentation_results[org_idx]['saved_incrementally'] = True
+            else:
+                segmentation_results[org_idx]['saved_incrementally'] = False
+                if verbose:
+                    print(f"         ⚠️  Failed to save organoid {org_idx} incrementally")
             
             nuclei_count = metadata['num_cells']
             total_nuclei += nuclei_count
@@ -1580,17 +2044,40 @@ def segment_condition(
     failed_segments = len(segmentation_results) - successful_segments
     skipped_segments = len(organoids_skipped)
     
+    # Count focus filtering results
+    focus_filtered_count = sum(1 for r in segmentation_results.values() 
+                              if not r['success'] and 'Out of focus' in r.get('error', ''))
+    other_failed_count = failed_segments - focus_filtered_count
+    
     if verbose:
         print(f"\n   📊 SEGMENTATION SUMMARY:")
         print(f"      → Total organoids: {len(organoid_indices)}")
         print(f"      → Processed: {len(organoids_to_process)}")
         print(f"      → Successful: {successful_segments}")
         print(f"      → Failed: {failed_segments}")
+        if CONFIG_AVAILABLE and ENABLE_FOCUS_FILTERING:
+            print(f"         • Out of focus: {focus_filtered_count}")
+            print(f"         • Other errors: {other_failed_count}")
         print(f"      → Skipped (existing): {skipped_segments}")
         print(f"      → Total nuclei detected: {total_nuclei}")
         
         avg_nuclei = total_nuclei/successful_segments if successful_segments > 0 else 0
         print(f"      → Average nuclei per organoid: {avg_nuclei:.1f}" if successful_segments > 0 else "      → Average nuclei per organoid: N/A")
+        
+        print(f"\n   🔍 FILTERING SUMMARY:")
+        if CONFIG_AVAILABLE:
+            print(f"      → Focus filtering: {'ENABLED' if ENABLE_FOCUS_FILTERING else 'DISABLED'}")
+            if ENABLE_FOCUS_FILTERING:
+                print(f"         • Method: {FOCUS_DETECTION_METHOD}")
+                print(f"         • Threshold: {MIN_FOCUS_SCORE}")
+                print(f"         • Filtered out: {focus_filtered_count} organoids")
+            print(f"      → Z-slice filtering: {'ENABLED' if REMOVE_BLACK_FRAMES else 'DISABLED'}")
+            if REMOVE_BLACK_FRAMES:
+                print(f"         • Method: {BLACK_FRAME_METHOD}")
+                print(f"         • Threshold: {BLACK_FRAME_THRESHOLD*100:.1f}% of max intensity")
+                print(f"         • Min z-slices: {MIN_Z_SLICES}")
+        else:
+            print(f"      → Config not available - filtering disabled")
         
         print(f"\n   ⏱️ PERFORMANCE SUMMARY:")
         print(f"      → Total processing time: {processing_times['total']:.1f}s")
@@ -1598,6 +2085,22 @@ def segment_condition(
         avg_per_organoid = segmentation_time/len(organoids_to_process) if organoids_to_process else 0
         print(f"      → Average per organoid: {avg_per_organoid:.1f}s" if organoids_to_process else "      → Average per organoid: N/A")
         print(f"      → Setup time: {processing_times['existing_check'] + processing_times['segmenter_init'] + processing_times['zarr_load']:.1f}s")
+    
+    # Incremental saving summary
+    if successful_segments > 0:
+        saved_incrementally = sum(1 for r in segmentation_results.values() 
+                                if r.get('saved_incrementally', False))
+        failed_saves = successful_segments - saved_incrementally
+        
+        print(f"\n   💾 INCREMENTAL SAVING SUMMARY:")
+        print(f"      → Successfully saved: {saved_incrementally}/{successful_segments} organoids")
+        if failed_saves > 0:
+            print(f"      → Failed to save: {failed_saves} organoids")
+            print(f"      → ⚠️  Some organoids processed but not saved - may need manual save")
+        else:
+            print(f"      → ✅ All successful segmentations saved immediately")
+        print(f"      → Save location: segmented/{condition_name}/")
+        print(f"      → Resume-safe: ✅ Process can be interrupted and resumed")
     
     return {
         'condition': condition_name,
@@ -1607,13 +2110,23 @@ def segment_condition(
         'processed_organoids': len(organoids_to_process),
         'successful_segments': successful_segments,
         'failed_segments': failed_segments,
+        'focus_filtered_segments': focus_filtered_count,
+        'other_failed_segments': other_failed_count,
         'skipped_segments': skipped_segments,
         'total_nuclei': total_nuclei,
         'segmentation_results': segmentation_results,
         'processing_times': processing_times,
         'existing_status': existing_status,
         'resume_used': resume,
-        'dry_run': dry_run
+        'dry_run': dry_run,
+        'filtering_applied': {
+            'focus_filtering': CONFIG_AVAILABLE and ENABLE_FOCUS_FILTERING,
+            'z_slice_filtering': CONFIG_AVAILABLE and REMOVE_BLACK_FRAMES,
+            'focus_method': FOCUS_DETECTION_METHOD if CONFIG_AVAILABLE else None,
+            'focus_threshold': MIN_FOCUS_SCORE if CONFIG_AVAILABLE else None,
+            'z_filter_method': BLACK_FRAME_METHOD if CONFIG_AVAILABLE else None,
+            'z_filter_threshold': BLACK_FRAME_THRESHOLD if CONFIG_AVAILABLE else None
+        }
     }
 
 def segment_all_conditions(
@@ -1689,16 +2202,16 @@ def segment_all_conditions(
                 verbose=verbose
             )
             
-            # Add segmentation to zarr file if successful
+            # Save segmented data to new segmented directory if successful
             if seg_results['successful_segments'] > 0:
-                zarr_success = add_segmentation_to_zarr_optimized(
-                    zarr_path,
-                    seg_results['segmentation_results'],
-                    dry_run=dry_run,
-                    save_full_resolution_only=True,
-                    verbose=verbose
-                )
-                seg_results['zarr_update_success'] = zarr_success
+                # With incremental saving, organoids are already saved
+                seg_results['segmented_save_success'] = True
+                if verbose:
+                    saved_count = sum(1 for r in seg_results['segmentation_results'].values() 
+                                    if r.get('saved_incrementally', False))
+                    print(f"   💾 Incremental saves: {saved_count}/{seg_results['successful_segments']} organoids saved")
+            else:
+                seg_results['segmented_save_success'] = False
             
             all_results[condition_name] = seg_results
             
@@ -1728,9 +2241,39 @@ def segment_all_conditions(
         print(f"   → Total nuclei detected: {total_nuclei}")
         print(f"   → Overall processing time: {overall_time/60:.1f} minutes")
         
+        # Focus filtering statistics
+        total_focus_filtered = sum(r.get('focus_filtered_segments', 0) for r in all_results.values())
+        total_other_failed = sum(r.get('other_failed_segments', 0) for r in all_results.values())
+        
+        if total_focus_filtered > 0 or total_other_failed > 0:
+            print(f"   → Failed segmentations: {total_focus_filtered + total_other_failed}")
+            if total_focus_filtered > 0:
+                print(f"      • Out of focus: {total_focus_filtered}")
+            if total_other_failed > 0:
+                print(f"      • Other errors: {total_other_failed}")
+        
         if total_successful > 0:
             print(f"   → Average nuclei per organoid: {total_nuclei/total_successful:.1f}")
             print(f"   → Average time per organoid: {overall_time/total_successful:.1f}s")
+        
+        # Overall filtering summary
+        any_focus_filtering = any(r.get('filtering_applied', {}).get('focus_filtering', False) 
+                                for r in all_results.values())
+        any_z_filtering = any(r.get('filtering_applied', {}).get('z_slice_filtering', False) 
+                            for r in all_results.values())
+        
+        if any_focus_filtering or any_z_filtering:
+            print(f"\n   🔍 FILTERING SUMMARY:")
+            if any_focus_filtering:
+                print(f"      → Focus filtering: ✅ APPLIED")
+                print(f"         • Organoids filtered: {total_focus_filtered}")
+                focus_rate = (total_focus_filtered / total_organoids * 100) if total_organoids > 0 else 0
+                print(f"         • Filtering rate: {focus_rate:.1f}%")
+            if any_z_filtering:
+                print(f"      → Z-slice filtering: ✅ APPLIED")
+                print(f"         • Black frames removed from all organoids")
+        else:
+            print(f"\n   ⚠️  NO FILTERING APPLIED - All organoids processed")
     
     return {
         'all_results': all_results,
@@ -1740,9 +2283,166 @@ def segment_all_conditions(
             'total_organoids': sum(r.get('total_organoids', 0) for r in all_results.values()),
             'total_successful': sum(r.get('successful_segments', 0) for r in all_results.values()),
             'total_nuclei': sum(r.get('total_nuclei', 0) for r in all_results.values()),
+            'total_focus_filtered': sum(r.get('focus_filtered_segments', 0) for r in all_results.values()),
+            'total_other_failed': sum(r.get('other_failed_segments', 0) for r in all_results.values()),
+            'focus_filtering_applied': any(r.get('filtering_applied', {}).get('focus_filtering', False) for r in all_results.values()),
+            'z_slice_filtering_applied': any(r.get('filtering_applied', {}).get('z_slice_filtering', False) for r in all_results.values()),
             'overall_time': overall_time
         }
     }
+
+def open_segmented_data_in_napari(
+    condition_name: Optional[str] = None,
+    organoid_idx: int = 0,
+    segmented_dir: Optional[Path] = None
+):
+    """
+    Open napari visualization for segmented data (z-optimized raw data + masks)
+    
+    Args:
+        condition_name: Name of condition to visualize (uses first if None)
+        organoid_idx: Index of organoid to visualize
+        segmented_dir: Directory containing the segmented zarr files
+        
+    Returns:
+        napari.Viewer instance or None
+    """
+    try:
+        import napari
+    except ImportError:
+        print("❌ Napari not available. Install with: pip install napari")
+        return None
+    
+    # Determine segmented directory
+    if segmented_dir is None:
+        try:
+            from karyosight.config import SEGMENTED_DIR
+            segmented_dir = Path(SEGMENTED_DIR)
+        except:
+            print("❌ Could not determine segmented directory")
+            return None
+    
+    if not segmented_dir.exists():
+        print(f"❌ Segmented directory not found: {segmented_dir}")
+        print(f"   → Make sure to run segmentation first to create segmented data")
+        return None
+    
+    # Find available conditions in segmented directory
+    condition_dirs = [d for d in segmented_dir.iterdir() if d.is_dir()]
+    available_conditions = []
+    
+    for condition_dir in condition_dirs:
+        segmented_zarr = condition_dir / f"{condition_dir.name}_segmented.zarr"
+        if segmented_zarr.exists():
+            available_conditions.append(condition_dir.name)
+    
+    if not available_conditions:
+        print("❌ No segmented conditions found")
+        print(f"   → Check directory: {segmented_dir}")
+        print(f"   → Run segmentation first to generate segmented data")
+        return None
+    
+    # Use specified condition or first available
+    if condition_name is None:
+        condition_name = available_conditions[0]
+    
+    if condition_name not in available_conditions:
+        print(f"❌ Condition '{condition_name}' not found in segmented data")
+        print(f"   Available conditions: {available_conditions}")
+        return None
+    
+    print(f"🎯 Loading segmented data: {condition_name}, organoid: {organoid_idx}")
+    
+    # Load segmented data
+    segmented_zarr = segmented_dir / condition_name / f"{condition_name}_segmented.zarr"
+    
+    try:
+        bundle = zarr.open_group(str(segmented_zarr), mode='r')
+        
+        # Find organoid
+        organoid_key = f"organoid_{organoid_idx:04d}"
+        if organoid_key not in bundle:
+            available_organoids = [k for k in bundle.keys() if k.startswith('organoid_')]
+            print(f"❌ Organoid {organoid_key} not found")
+            print(f"   Available organoids: {len(available_organoids)}")
+            return None
+        
+        organoid_group = bundle[organoid_key]
+        
+        # Load z-optimized raw data
+        raw_data = organoid_group['data'][:]
+        if hasattr(raw_data, 'compute'):
+            raw_data = raw_data.compute()
+        else:
+            raw_data = np.array(raw_data)
+        
+        # Load z-optimized masks
+        masks = organoid_group['masks'][:]
+        if hasattr(masks, 'compute'):
+            masks = masks.compute()
+        else:
+            masks = np.array(masks)
+        
+        # Get metadata
+        metadata = dict(organoid_group.attrs)
+        n_nuclei = metadata.get('n_nuclei', len(np.unique(masks)) - 1)
+        original_shape = metadata.get('original_raw_shape', raw_data.shape)
+        compression = metadata.get('compression_ratio_percent', 0)
+        
+        print(f"✅ Segmented data loaded:")
+        print(f"   → Raw data: {raw_data.shape} (z-optimized)")
+        print(f"   → Masks: {masks.shape} (z-optimized)")
+        print(f"   → Nuclei count: {n_nuclei}")
+        print(f"   → Original shape: {original_shape}")
+        print(f"   → Z-compression: {compression:.1f}%")
+        print(f"   → Source: {segmented_zarr}")
+        
+        # Create napari viewer
+        print(f"🔍 Opening in napari...")
+        viewer = napari.Viewer()
+        
+        # Add z-optimized raw data channels
+        if raw_data.ndim == 4:  # [C, Z, Y, X]
+            # Get channel names from config
+            try:
+                if CONFIG_AVAILABLE:
+                    from karyosight.config import CHANNELS
+                    channel_names = CHANNELS
+                else:
+                    channel_names = ['nucleus', 'tetraploid', 'diploid', 'sox9', 'sox2', 'brightfield']
+            except:
+                channel_names = ['DAPI', 'GFP', 'RFP', 'Cy5', 'Channel_4', 'Channel_5']
+            
+            for c in range(raw_data.shape[0]):
+                channel_name = channel_names[c] if c < len(channel_names) else f'Channel_{c}'
+                viewer.add_image(
+                    raw_data[c],
+                    name=f'{condition_name} - {channel_name} (Z-opt)',
+                    colormap='gray' if c == 0 else 'green' if c == 1 else 'red' if c == 2 else 'cyan',
+                    contrast_limits=[raw_data[c].min(), np.percentile(raw_data[c], 99)]
+                )
+        else:  # [Z, Y, X] - single channel
+            viewer.add_image(
+                raw_data,
+                name=f'{condition_name} - DAPI (Z-opt)',
+                colormap='gray',
+                contrast_limits=[raw_data.min(), np.percentile(raw_data, 99)]
+            )
+        
+        # Add z-optimized segmentation masks
+        viewer.add_labels(
+            masks,
+            name=f'Z-Optimized Masks ({n_nuclei} nuclei)',
+            opacity=0.7
+        )
+        
+        print(f"✅ Napari opened successfully!")
+        print(f"💡 Viewing z-optimized data ({compression:.1f}% compression)")
+        return viewer
+        
+    except Exception as e:
+        print(f"❌ Error loading segmented data: {e}")
+        return None
 
 def open_segmentation_napari(
     condition_name: Optional[str] = None,
@@ -1750,7 +2450,7 @@ def open_segmentation_napari(
     cropped_dir: Optional[Path] = None
 ):
     """
-    Open napari visualization for segmentation results
+    Open napari visualization for segmentation results from cropped directory (legacy)
     
     Args:
         condition_name: Name of condition to visualize (uses first if None)
@@ -1760,6 +2460,9 @@ def open_segmentation_napari(
     Returns:
         napari.Viewer instance or None
     """
+    print("⚠️  Using legacy cropped directory visualization")
+    print("   → For new z-optimized results, use open_segmented_data_in_napari()")
+    
     try:
         import napari
     except ImportError:
@@ -1889,6 +2592,1512 @@ def open_segmentation_napari(
     except Exception as e:
         print(f"❌ Error loading data: {e}")
         return None
+
+# Focus detection and filtering functions
+def calculate_organoid_focus_score(image_3d: np.ndarray, method: str = 'variance') -> float:
+    """
+    Calculate focus score for an organoid using specified method
+    
+    Args:
+        image_3d: 3D image array [Z, Y, X]
+        method: Focus detection method ('variance', 'gradient', 'laplacian')
+        
+    Returns:
+        Focus score (higher = better focus)
+    """
+    if method == 'variance':
+        return np.var(image_3d.astype(np.float64))
+    elif method == 'gradient':
+        # Gradient-based focus measure
+        grad_x = np.gradient(image_3d, axis=2)
+        grad_y = np.gradient(image_3d, axis=1)
+        grad_z = np.gradient(image_3d, axis=0)
+        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2 + grad_z**2)
+        return np.mean(gradient_magnitude)
+    elif method == 'laplacian':
+        # Laplacian-based focus measure
+        from scipy import ndimage
+        laplacian = ndimage.laplace(image_3d.astype(np.float64))
+        return np.var(laplacian)
+    else:
+        raise ValueError(f"Unknown focus detection method: {method}")
+
+def remove_black_z_slices(
+    image_3d: np.ndarray, 
+    threshold: float = 0.001,
+    method: str = 'intensity_threshold',
+    min_z_slices: int = 20,
+    verbose: bool = False
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Remove black/empty z-slices from 3D image
+    
+    Args:
+        image_3d: 3D image array [Z, Y, X]
+        threshold: Threshold for black frame detection (fraction of max intensity)
+        method: Detection method ('intensity_threshold', 'content_ratio', 'mean_intensity')
+        min_z_slices: Minimum number of z-slices to keep
+        verbose: Print processing information
+        
+    Returns:
+        Tuple of (filtered_image, metadata)
+    """
+    if verbose:
+        print(f"🧹 Removing black z-slices (threshold={threshold*100:.1f}%, method={method})")
+    
+    original_shape = image_3d.shape
+    nz, ny, nx = original_shape
+    
+    # Calculate threshold based on image max
+    max_intensity = image_3d.max()
+    intensity_threshold = max_intensity * threshold
+    
+    # Identify non-black slices based on method
+    if method == 'intensity_threshold':
+        # Keep slices with max intensity above threshold
+        slice_max = np.max(image_3d, axis=(1, 2))
+        keep_slices = slice_max > intensity_threshold
+    elif method == 'content_ratio':
+        # Keep slices with enough non-zero pixels
+        non_zero_ratio = np.sum(image_3d > intensity_threshold, axis=(1, 2)) / (ny * nx)
+        keep_slices = non_zero_ratio > 0.1  # At least 10% non-zero pixels
+    elif method == 'mean_intensity':
+        # Keep slices with mean intensity above threshold
+        slice_mean = np.mean(image_3d, axis=(1, 2))
+        keep_slices = slice_mean > intensity_threshold
+    else:
+        raise ValueError(f"Unknown black frame detection method: {method}")
+    
+    # Find continuous regions of non-black slices
+    keep_indices = np.where(keep_slices)[0]
+    
+    if len(keep_indices) == 0:
+        if verbose:
+            print(f"   ⚠️  No slices pass threshold - keeping middle {min_z_slices} slices")
+        # Fallback: keep middle slices
+        start_idx = max(0, (nz - min_z_slices) // 2)
+        end_idx = min(nz, start_idx + min_z_slices)
+        filtered_image = image_3d[start_idx:end_idx]
+        kept_slices = list(range(start_idx, end_idx))
+    else:
+        # Keep the largest continuous region
+        if len(keep_indices) < min_z_slices:
+            if verbose:
+                print(f"   ⚠️  Only {len(keep_indices)} slices pass threshold - expanding to {min_z_slices}")
+            # Expand around the center of good slices
+            center_idx = keep_indices[len(keep_indices) // 2]
+            start_idx = max(0, center_idx - min_z_slices // 2)
+            end_idx = min(nz, start_idx + min_z_slices)
+            filtered_image = image_3d[start_idx:end_idx]
+            kept_slices = list(range(start_idx, end_idx))
+        else:
+            # Use the continuous good slices
+            start_idx = keep_indices[0]
+            end_idx = keep_indices[-1] + 1
+            filtered_image = image_3d[start_idx:end_idx]
+            kept_slices = list(keep_indices)
+    
+    removed_count = nz - len(kept_slices)
+    
+    if verbose:
+        print(f"   ✅ Z-slice filtering complete:")
+        print(f"      → Original slices: {nz}")
+        print(f"      → Kept slices: {len(kept_slices)} (z={kept_slices[0]}-{kept_slices[-1]})")
+        print(f"      → Removed slices: {removed_count}")
+        print(f"      → New shape: {filtered_image.shape}")
+    
+    metadata = {
+        'z_filtering_applied': True,
+        'original_z_slices': nz,
+        'kept_z_slices': len(kept_slices),
+        'removed_z_slices': removed_count,
+        'kept_slice_indices': kept_slices,
+        'filtering_method': method,
+        'threshold_used': threshold,
+        'max_intensity': max_intensity,
+        'intensity_threshold': intensity_threshold
+    }
+    
+    return filtered_image, metadata
+
+def optimize_z_slices_after_segmentation(
+    image_3d: np.ndarray,
+    masks_3d: np.ndarray,
+    strategy: str = 'z_range',
+    padding: int = 2,
+    verbose: bool = False
+) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """
+    Remove z-slices that contain no segmented nuclei (post-segmentation optimization)
+    
+    Args:
+        image_3d: Original 3D image [Z, Y, X]
+        masks_3d: Segmentation masks [Z, Y, X] 
+        strategy: Optimization strategy ('covered_only', 'z_range', 'padded_range')
+        padding: Number of extra z-slices to keep on each side (for 'padded_range')
+        verbose: Print processing information
+        
+    Returns:
+        Tuple of (optimized_image, optimized_masks, metadata)
+    """
+    if verbose:
+        print(f"✂️ Post-segmentation z-slice optimization (strategy={strategy})")
+    
+    original_z, ny, nx = masks_3d.shape
+    
+    # Find z-slices that contain segmented nuclei
+    z_has_nuclei = np.array([np.any(masks_3d[z] > 0) for z in range(original_z)])
+    z_indices_with_nuclei = np.where(z_has_nuclei)[0]
+    
+    if len(z_indices_with_nuclei) == 0:
+        if verbose:
+            print(f"   ⚠️  No nuclei found in any z-slice - keeping original data")
+        return image_3d, masks_3d, {
+            'z_optimization_applied': False,
+            'reason': 'no_nuclei_found',
+            'original_z_count': original_z,
+            'optimized_z_count': original_z
+        }
+    
+    # Determine z-slices to keep based on strategy
+    if strategy == "covered_only":
+        # Keep only z-slices with segmented nuclei
+        z_slices_to_keep = z_indices_with_nuclei.tolist()
+        
+    elif strategy == "z_range":
+        # Keep z-range from first to last slice with nuclei
+        z_min, z_max = z_indices_with_nuclei[0], z_indices_with_nuclei[-1]
+        z_slices_to_keep = list(range(z_min, z_max + 1))
+        
+    elif strategy == "padded_range":
+        # Keep z-range with padding around nuclei-containing slices
+        z_min, z_max = z_indices_with_nuclei[0], z_indices_with_nuclei[-1]
+        z_min_padded = max(0, z_min - padding)
+        z_max_padded = min(original_z - 1, z_max + padding)
+        z_slices_to_keep = list(range(z_min_padded, z_max_padded + 1))
+        
+    else:
+        # Unknown strategy - keep all
+        z_slices_to_keep = list(range(original_z))
+    
+    # Apply optimization if beneficial
+    z_slices_removed = [z for z in range(original_z) if z not in z_slices_to_keep]
+    
+    if len(z_slices_removed) == 0:
+        if verbose:
+            print(f"   💡 No z-slices can be removed with strategy '{strategy}'")
+        return image_3d, masks_3d, {
+            'z_optimization_applied': False,
+            'reason': 'no_slices_to_remove',
+            'original_z_count': original_z,
+            'optimized_z_count': original_z,
+            'strategy': strategy
+        }
+    
+    # Create optimized data
+    optimized_image = image_3d[z_slices_to_keep]
+    optimized_masks = masks_3d[z_slices_to_keep]
+    
+    compression_ratio = len(z_slices_removed) / original_z * 100
+    
+    if verbose:
+        print(f"   ✅ Z-slice optimization complete:")
+        print(f"      → Original z-slices: {original_z}")
+        print(f"      → Optimized z-slices: {len(z_slices_to_keep)}")
+        print(f"      → Removed z-slices: {len(z_slices_removed)}")
+        print(f"      → Compression: {compression_ratio:.1f}%")
+        print(f"      → Nuclei z-range: {z_indices_with_nuclei[0]}-{z_indices_with_nuclei[-1]}")
+        print(f"      → Kept z-range: {z_slices_to_keep[0]}-{z_slices_to_keep[-1]}")
+    
+    metadata = {
+        'z_optimization_applied': True,
+        'strategy': strategy,
+        'padding': padding if strategy == 'padded_range' else None,
+        'original_z_count': original_z,
+        'optimized_z_count': len(z_slices_to_keep),
+        'removed_z_count': len(z_slices_removed),
+        'compression_ratio_percent': compression_ratio,
+        'nuclei_z_range': (int(z_indices_with_nuclei[0]), int(z_indices_with_nuclei[-1])),
+        'kept_z_range': (z_slices_to_keep[0], z_slices_to_keep[-1]),
+        'z_slices_kept': z_slices_to_keep,
+        'z_slices_removed': z_slices_removed,
+        'nuclei_containing_slices': len(z_indices_with_nuclei)
+    }
+    
+    return optimized_image, optimized_masks, metadata
+
+def test_filtering_setup(
+    cropped_dir: Optional[Path] = None,
+    condition_name: Optional[str] = None,
+    organoid_idx: int = 0,
+    channel: int = 0,
+    verbose: bool = True
+) -> Dict[str, Any]:
+    """
+    Test focus filtering and z-slice processing setup on a single organoid
+    
+    Args:
+        cropped_dir: Directory containing cropped zarr files
+        condition_name: Condition to test (uses first available if None)
+        organoid_idx: Organoid index to test
+        channel: Channel to test
+        verbose: Print detailed information
+        
+    Returns:
+        Dictionary with test results
+    """
+    print("🧪 TESTING FILTERING SETUP")
+    print("=" * 50)
+    
+    # Set up directories
+    if cropped_dir is None:
+        try:
+            from karyosight.config import CROPPED_DIR
+            cropped_dir = Path(CROPPED_DIR)
+        except:
+            cropped_dir = Path("D:/LB_TEST/cropped")
+    
+    # Find available conditions
+    zarr_files = []
+    for condition_dir in cropped_dir.iterdir():
+        if condition_dir.is_dir():
+            bundled_zarr = condition_dir / f"{condition_dir.name}_bundled.zarr"
+            if bundled_zarr.exists():
+                zarr_files.append(bundled_zarr)
+    
+    if not zarr_files:
+        print(f"❌ No zarr files found in {cropped_dir}")
+        return {'error': 'No zarr files found'}
+    
+    # Select zarr file
+    if condition_name is None:
+        zarr_path = zarr_files[0]
+        condition_name = zarr_path.parent.name
+    else:
+        zarr_path = None
+        for zf in zarr_files:
+            if zf.parent.name == condition_name:
+                zarr_path = zf
+                break
+        if zarr_path is None:
+            available = [zf.parent.name for zf in zarr_files]
+            print(f"❌ Condition '{condition_name}' not found. Available: {available}")
+            return {'error': f'Condition not found: {condition_name}'}
+    
+    print(f"📂 Testing with: {condition_name}, organoid {organoid_idx}")
+    print(f"   File: {zarr_path}")
+    
+    # Load organoid data
+    try:
+        bundle = zarr.open_group(str(zarr_path), mode='r')
+        organoid_key = f"organoid_{organoid_idx:04d}"
+        
+        if hasattr(bundle, 'keys') and organoid_key in bundle:
+            organoid_data = bundle[organoid_key]['data'][:]
+            img_3d = organoid_data[channel]
+        else:
+            organoid_data = bundle['data'][organoid_idx]
+            img_3d = organoid_data[channel]
+        
+        if hasattr(img_3d, 'compute'):
+            img_3d = img_3d.compute()
+        else:
+            img_3d = np.array(img_3d)
+        
+        print(f"✅ Loaded image: {img_3d.shape}")
+        print(f"   Data type: {img_3d.dtype}")
+        print(f"   Intensity range: {img_3d.min():.1f} - {img_3d.max():.1f}")
+        
+    except Exception as e:
+        print(f"❌ Error loading organoid: {e}")
+        return {'error': f'Failed to load organoid: {e}'}
+    
+    test_results = {
+        'condition': condition_name,
+        'organoid_idx': organoid_idx,
+        'original_shape': img_3d.shape,
+        'original_intensity_range': (float(img_3d.min()), float(img_3d.max()))
+    }
+    
+    # Test focus filtering
+    print(f"\n🔍 TESTING FOCUS FILTERING:")
+    if CONFIG_AVAILABLE and ENABLE_FOCUS_FILTERING:
+        print(f"   ✅ Focus filtering ENABLED")
+        print(f"      → Method: {FOCUS_DETECTION_METHOD}")
+        print(f"      → Threshold: {MIN_FOCUS_SCORE}")
+        
+        focus_score = calculate_organoid_focus_score(img_3d, method=FOCUS_DETECTION_METHOD)
+        is_in_focus = focus_score >= MIN_FOCUS_SCORE
+        
+        print(f"   📊 Test Results:")
+        print(f"      → Focus score: {focus_score:.1f}")
+        print(f"      → In focus: {'YES' if is_in_focus else 'NO'}")
+        
+        if is_in_focus:
+            print(f"      ✅ Organoid would be SEGMENTED")
+        else:
+            print(f"      ❌ Organoid would be SKIPPED (out of focus)")
+        
+        test_results['focus_filtering'] = {
+            'enabled': True,
+            'method': FOCUS_DETECTION_METHOD,
+            'threshold': MIN_FOCUS_SCORE,
+            'focus_score': focus_score,
+            'is_in_focus': is_in_focus,
+            'would_be_processed': is_in_focus
+        }
+    else:
+        print(f"   ❌ Focus filtering DISABLED")
+        print(f"      → All organoids will be processed regardless of focus")
+        
+        test_results['focus_filtering'] = {
+            'enabled': False,
+            'would_be_processed': True
+        }
+    
+    # Test z-slice filtering
+    print(f"\n🧹 TESTING Z-SLICE FILTERING:")
+    if CONFIG_AVAILABLE and REMOVE_BLACK_FRAMES:
+        print(f"   ✅ Z-slice filtering ENABLED")
+        print(f"      → Method: {BLACK_FRAME_METHOD}")
+        print(f"      → Threshold: {BLACK_FRAME_THRESHOLD*100:.1f}% of max intensity")
+        print(f"      → Min z-slices: {MIN_Z_SLICES}")
+        
+        filtered_img, z_metadata = remove_black_z_slices(
+            img_3d,
+            threshold=BLACK_FRAME_THRESHOLD,
+            method=BLACK_FRAME_METHOD,
+            min_z_slices=MIN_Z_SLICES,
+            verbose=True
+        )
+        
+        test_results['z_slice_filtering'] = {
+            'enabled': True,
+            'method': BLACK_FRAME_METHOD,
+            'threshold': BLACK_FRAME_THRESHOLD,
+            'min_z_slices': MIN_Z_SLICES,
+            'original_z_slices': z_metadata['original_z_slices'],
+            'kept_z_slices': z_metadata['kept_z_slices'],
+            'removed_z_slices': z_metadata['removed_z_slices'],
+            'filtered_shape': filtered_img.shape,
+            'kept_slice_indices': z_metadata['kept_slice_indices']
+        }
+        
+        img_3d = filtered_img  # Use filtered image for any further processing
+        
+    else:
+        print(f"   ❌ Z-slice filtering DISABLED")
+        print(f"      → All z-slices will be used")
+        
+        test_results['z_slice_filtering'] = {
+            'enabled': False,
+            'filtered_shape': img_3d.shape
+        }
+    
+    # Test post-segmentation z-slice optimization
+    print(f"\n✂️ TESTING POST-SEGMENTATION Z-SLICE OPTIMIZATION:")
+    if CONFIG_AVAILABLE and ENABLE_Z_SLICE_OPTIMIZATION:
+        print(f"   ✅ Z-slice optimization ENABLED")
+        print(f"      → Strategy: {Z_OPTIMIZATION_STRATEGY}")
+        if Z_OPTIMIZATION_STRATEGY == 'padded_range':
+            print(f"      → Padding: {Z_OPTIMIZATION_PADDING} slices")
+        
+        # Simulate masks with nuclei in middle z-slices for demonstration
+        demo_shape = test_results['z_slice_filtering']['filtered_shape']
+        demo_masks = np.zeros(demo_shape, dtype=np.uint16)
+        # Put fake nuclei in middle third of z-stack
+        z_start = demo_shape[0] // 3
+        z_end = 2 * demo_shape[0] // 3
+        demo_masks[z_start:z_end, 100:200, 100:200] = 1  # Fake nucleus
+        
+        # Test optimization
+        _, _, z_opt_test = optimize_z_slices_after_segmentation(
+            img_3d, demo_masks,
+            strategy=Z_OPTIMIZATION_STRATEGY,
+            padding=Z_OPTIMIZATION_PADDING,
+            verbose=True
+        )
+        
+        test_results['z_slice_optimization'] = {
+            'enabled': True,
+            'strategy': Z_OPTIMIZATION_STRATEGY,
+            'padding': Z_OPTIMIZATION_PADDING,
+            'demo_results': z_opt_test,
+            'potential_compression': z_opt_test.get('compression_ratio_percent', 0)
+        }
+        
+    else:
+        print(f"   ❌ Post-segmentation z-slice optimization DISABLED")
+        print(f"      → Final masks will keep all z-slices")
+        
+        test_results['z_slice_optimization'] = {
+            'enabled': False
+        }
+    
+    # Test overall processing status
+    print(f"\n🎯 OVERALL TEST RESULTS:")
+    would_process = (
+        test_results['focus_filtering']['would_be_processed'] 
+        if test_results['focus_filtering']['enabled'] 
+        else True
+    )
+    
+    if would_process:
+        final_shape = test_results['z_slice_filtering']['filtered_shape']
+        print(f"   ✅ This organoid WOULD BE SEGMENTED")
+        print(f"      → Image shape before segmentation: {final_shape}")
+        if test_results['z_slice_filtering']['enabled']:
+            print(f"      → Z-slices used for segmentation: {test_results['z_slice_filtering']['kept_z_slices']}/{test_results['z_slice_filtering']['original_z_slices']}")
+        if test_results['z_slice_optimization']['enabled']:
+            potential_compression = test_results['z_slice_optimization']['potential_compression']
+            print(f"      → Z-slices will be further optimized after segmentation (~{potential_compression:.1f}% reduction)")
+    else:
+        print(f"   ❌ This organoid WOULD BE SKIPPED")
+        print(f"      → Reason: Out of focus")
+    
+    test_results['final_processing_decision'] = {
+        'would_be_processed': would_process,
+        'final_shape': test_results['z_slice_filtering']['filtered_shape']
+    }
+    
+    print(f"\n💡 CONFIG STATUS:")
+    print(f"   → Config available: {CONFIG_AVAILABLE}")
+    if CONFIG_AVAILABLE:
+        print(f"   → Focus filtering: {ENABLE_FOCUS_FILTERING}")
+        print(f"   → Pre-segmentation z-slice filtering: {REMOVE_BLACK_FRAMES}")
+        print(f"   → Post-segmentation z-slice optimization: {ENABLE_Z_SLICE_OPTIMIZATION}")
+    else:
+        print(f"   → ⚠️  No filtering will be applied (config not available)")
+    
+    return test_results
+
+# ======================================================================================
+# SEGMENTED DATA UTILITIES
+# ======================================================================================
+
+def list_segmented_conditions(segmented_dir: Optional[Path] = None) -> List[str]:
+    """
+    List available segmented conditions
+    
+    Args:
+        segmented_dir: Directory containing segmented zarr files
+        
+    Returns:
+        List of available condition names
+    """
+    if segmented_dir is None:
+        try:
+            from karyosight.config import SEGMENTED_DIR
+            segmented_dir = Path(SEGMENTED_DIR)
+        except:
+            segmented_dir = Path("D:/LB_TEST/segmented")
+    
+    if not segmented_dir.exists():
+        print(f"❌ Segmented directory not found: {segmented_dir}")
+        return []
+    
+    available_conditions = []
+    for condition_dir in segmented_dir.iterdir():
+        if condition_dir.is_dir():
+            segmented_zarr = condition_dir / f"{condition_dir.name}_segmented.zarr"
+            if segmented_zarr.exists():
+                available_conditions.append(condition_dir.name)
+    
+    return sorted(available_conditions)
+
+def get_segmented_organoid_count(condition_name: str, segmented_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    Get information about organoids in a segmented condition
+    
+    Args:
+        condition_name: Name of condition
+        segmented_dir: Directory containing segmented zarr files
+        
+    Returns:
+        Dictionary with organoid information
+    """
+    if segmented_dir is None:
+        try:
+            from karyosight.config import SEGMENTED_DIR
+            segmented_dir = Path(SEGMENTED_DIR)
+        except:
+            segmented_dir = Path("D:/LB_TEST/segmented")
+    
+    segmented_zarr = segmented_dir / condition_name / f"{condition_name}_segmented.zarr"
+    
+    if not segmented_zarr.exists():
+        return {'error': f'Segmented zarr not found: {segmented_zarr}'}
+    
+    try:
+        bundle = zarr.open_group(str(segmented_zarr), mode='r')
+        
+        organoid_keys = [k for k in bundle.keys() if k.startswith('organoid_')]
+        organoid_indices = sorted([int(k.split('_')[1]) for k in organoid_keys])
+        
+        total_nuclei = 0
+        organoid_info = {}
+        
+        for org_key in organoid_keys:
+            org_idx = int(org_key.split('_')[1])
+            org_group = bundle[org_key]
+            metadata = dict(org_group.attrs)
+            
+            n_nuclei = metadata.get('n_nuclei', 0)
+            compression = metadata.get('compression_ratio_percent', 0)
+            original_shape = metadata.get('original_raw_shape', [])
+            optimized_shape = metadata.get('optimized_raw_shape', [])
+            
+            organoid_info[org_idx] = {
+                'n_nuclei': n_nuclei,
+                'compression_percent': compression,
+                'original_shape': original_shape,
+                'optimized_shape': optimized_shape
+            }
+            
+            total_nuclei += n_nuclei
+        
+        bundle_metadata = dict(bundle.attrs)
+        
+        return {
+            'condition': condition_name,
+            'n_organoids': len(organoid_indices),
+            'organoid_indices': organoid_indices,
+            'total_nuclei': total_nuclei,
+            'average_nuclei_per_organoid': total_nuclei / len(organoid_indices) if organoid_indices else 0,
+            'average_compression_percent': bundle_metadata.get('average_compression_percent', 0),
+            'organoid_details': organoid_info,
+            'zarr_path': str(segmented_zarr)
+        }
+        
+    except Exception as e:
+        return {'error': f'Error reading segmented data: {e}'}
+
+def quick_view_segmented(
+    condition_name: Optional[str] = None,
+    organoid_idx: int = 0,
+    segmented_dir: Optional[Path] = None
+):
+    """
+    Quick function to view segmented data in napari
+    
+    Args:
+        condition_name: Condition to view (first available if None)
+        organoid_idx: Organoid index to view
+        segmented_dir: Directory containing segmented zarr files
+        
+    Returns:
+        napari.Viewer instance or None
+    """
+    # List available conditions if none specified
+    if condition_name is None:
+        available = list_segmented_conditions(segmented_dir)
+        if not available:
+            print("❌ No segmented conditions found")
+            return None
+        condition_name = available[0]
+        print(f"📋 Available conditions: {available}")
+        print(f"🎯 Using: {condition_name}")
+    
+    # Get organoid info
+    info = get_segmented_organoid_count(condition_name, segmented_dir)
+    if 'error' in info:
+        print(f"❌ {info['error']}")
+        return None
+    
+    print(f"📊 Condition info:")
+    print(f"   → Organoids: {info['n_organoids']}")
+    print(f"   → Total nuclei: {info['total_nuclei']}")
+    print(f"   → Average compression: {info['average_compression_percent']:.1f}%")
+    print(f"   → Available organoid indices: {info['organoid_indices']}")
+    
+    if organoid_idx not in info['organoid_indices']:
+        print(f"❌ Organoid {organoid_idx} not available")
+        print(f"   → Use one of: {info['organoid_indices']}")
+        return None
+    
+    # Open in napari
+    return open_segmented_data_in_napari(condition_name, organoid_idx, segmented_dir)
+
+def compare_segmented_conditions(
+    condition_names: Optional[List[str]] = None,
+    organoid_idx: int = 0,
+    segmented_dir: Optional[Path] = None
+):
+    """
+    Compare multiple segmented conditions side by side in napari
+    
+    Args:
+        condition_names: List of conditions to compare (all available if None)
+        organoid_idx: Organoid index to compare
+        segmented_dir: Directory containing segmented zarr files
+        
+    Returns:
+        napari.Viewer instance or None
+    """
+    try:
+        import napari
+    except ImportError:
+        print("❌ Napari not available. Install with: pip install napari")
+        return None
+    
+    # Get available conditions
+    available = list_segmented_conditions(segmented_dir)
+    if not available:
+        print("❌ No segmented conditions found")
+        return None
+    
+    if condition_names is None:
+        condition_names = available
+    
+    # Validate condition names
+    missing = [c for c in condition_names if c not in available]
+    if missing:
+        print(f"❌ Conditions not found: {missing}")
+        print(f"   Available: {available}")
+        return None
+    
+    print(f"🔀 Comparing {len(condition_names)} conditions, organoid {organoid_idx}")
+    
+    # Determine segmented directory
+    if segmented_dir is None:
+        try:
+            from karyosight.config import SEGMENTED_DIR
+            segmented_dir = Path(SEGMENTED_DIR)
+        except:
+            segmented_dir = Path("D:/LB_TEST/segmented")
+    
+    # Create napari viewer
+    print(f"🔍 Opening comparison in napari...")
+    viewer = napari.Viewer()
+    
+    # Load data for each condition
+    for i, condition_name in enumerate(condition_names):
+        try:
+            segmented_zarr = segmented_dir / condition_name / f"{condition_name}_segmented.zarr"
+            bundle = zarr.open_group(str(segmented_zarr), mode='r')
+            organoid_key = f"organoid_{organoid_idx:04d}"
+            
+            if organoid_key not in bundle:
+                print(f"   ⚠️  Organoid {organoid_idx} not found in {condition_name}")
+                continue
+            
+            organoid_group = bundle[organoid_key]
+            
+            # Load data
+            raw_data = organoid_group['data'][:]
+            if hasattr(raw_data, 'compute'):
+                raw_data = raw_data.compute()
+            masks = organoid_group['masks'][:]
+            if hasattr(masks, 'compute'):
+                masks = masks.compute()
+            
+            # Get metadata
+            metadata = dict(organoid_group.attrs)
+            n_nuclei = metadata.get('n_nuclei', 0)
+            compression = metadata.get('compression_ratio_percent', 0)
+            
+            # Add to viewer with unique names
+            if raw_data.ndim == 4:  # [C, Z, Y, X]
+                # Add nucleus channel only for comparison
+                viewer.add_image(
+                    raw_data[0],
+                    name=f'{condition_name} - DAPI (Z-opt)',
+                    colormap='gray',
+                    visible=(i == 0),  # Only show first condition initially
+                    contrast_limits=[raw_data[0].min(), np.percentile(raw_data[0], 99)]
+                )
+            else:  # [Z, Y, X]
+                viewer.add_image(
+                    raw_data,
+                    name=f'{condition_name} - DAPI (Z-opt)',
+                    colormap='gray',
+                    visible=(i == 0),
+                    contrast_limits=[raw_data.min(), np.percentile(raw_data, 99)]
+                )
+            
+            # Add masks
+            viewer.add_labels(
+                masks,
+                name=f'{condition_name} - Masks ({n_nuclei} nuclei, {compression:.1f}% comp)',
+                opacity=0.7,
+                visible=(i == 0)  # Only show first condition initially
+            )
+            
+            print(f"   ✅ Loaded {condition_name}: {n_nuclei} nuclei, {compression:.1f}% compression")
+            
+        except Exception as e:
+            print(f"   ❌ Error loading {condition_name}: {e}")
+            continue
+    
+    print(f"✅ Comparison viewer opened!")
+    print(f"💡 Tips:")
+    print(f"   • Toggle layer visibility to compare conditions")
+    print(f"   • All data is z-optimized for consistent comparison")
+    print(f"   • Use opacity sliders to overlay different masks")
+    
+    return viewer
+
+def compare_raw_vs_optimized(
+    condition_name: Optional[str] = None,
+    organoid_idx: int = 0,
+    cropped_dir: Optional[Path] = None,
+    segmented_dir: Optional[Path] = None
+):
+    """
+    Compare original raw data vs z-optimized data side-by-side in napari
+    
+    Args:
+        condition_name: Condition to compare (first available if None)
+        organoid_idx: Organoid index to compare
+        cropped_dir: Directory containing original cropped zarr files
+        segmented_dir: Directory containing z-optimized segmented zarr files
+        
+    Returns:
+        napari.Viewer instance or None
+    """
+    try:
+        import napari
+    except ImportError:
+        print("❌ Napari not available. Install with: pip install napari")
+        return None
+    
+    # Determine directories
+    if cropped_dir is None:
+        try:
+            from karyosight.config import CROPPED_DIR
+            cropped_dir = Path(CROPPED_DIR)
+        except:
+            cropped_dir = Path("D:/LB_TEST/cropped")
+    
+    if segmented_dir is None:
+        try:
+            from karyosight.config import SEGMENTED_DIR
+            segmented_dir = Path(SEGMENTED_DIR)
+        except:
+            segmented_dir = Path("D:/LB_TEST/segmented")
+    
+    # Find available conditions
+    if condition_name is None:
+        # Look for conditions that exist in both directories
+        cropped_conditions = []
+        for condition_dir in cropped_dir.iterdir():
+            if condition_dir.is_dir():
+                bundled_zarr = condition_dir / f"{condition_dir.name}_bundled.zarr"
+                if bundled_zarr.exists():
+                    cropped_conditions.append(condition_dir.name)
+        
+        segmented_conditions = list_segmented_conditions(segmented_dir)
+        
+        # Find conditions that exist in both
+        common_conditions = list(set(cropped_conditions) & set(segmented_conditions))
+        
+        if not common_conditions:
+            print("❌ No conditions found in both cropped and segmented directories")
+            print(f"   Cropped: {cropped_conditions}")
+            print(f"   Segmented: {segmented_conditions}")
+            return None
+        
+        condition_name = common_conditions[0]
+        print(f"📋 Available conditions: {common_conditions}")
+        print(f"🎯 Using: {condition_name}")
+    
+    print(f"🔀 COMPARING RAW vs Z-OPTIMIZED DATA")
+    print(f"=" * 60)
+    print(f"Condition: {condition_name}, Organoid: {organoid_idx}")
+    
+    # Load original raw data from cropped directory
+    cropped_zarr = cropped_dir / condition_name / f"{condition_name}_bundled.zarr"
+    original_data = None
+    original_shape = None
+    
+    if cropped_zarr.exists():
+        try:
+            bundle = zarr.open_group(str(cropped_zarr), mode='r')
+            organoid_key = f"organoid_{organoid_idx:04d}"
+            
+            if organoid_key in bundle:
+                organoid_group = bundle[organoid_key]
+                original_data = organoid_group['data'][:]
+                if hasattr(original_data, 'compute'):
+                    original_data = original_data.compute()
+                else:
+                    original_data = np.array(original_data)
+                
+                original_shape = original_data.shape
+                print(f"✅ Original raw data loaded: {original_shape}")
+            else:
+                print(f"❌ Organoid {organoid_key} not found in cropped data")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error loading original data: {e}")
+            return None
+    else:
+        print(f"❌ Cropped zarr not found: {cropped_zarr}")
+        return None
+    
+    # Load z-optimized data from segmented directory
+    segmented_zarr = segmented_dir / condition_name / f"{condition_name}_segmented.zarr"
+    optimized_data = None
+    optimized_masks = None
+    optimized_shape = None
+    compression_ratio = 0
+    
+    if segmented_zarr.exists():
+        try:
+            bundle = zarr.open_group(str(segmented_zarr), mode='r')
+            organoid_key = f"organoid_{organoid_idx:04d}"
+            
+            if organoid_key in bundle:
+                organoid_group = bundle[organoid_key]
+                
+                # Load z-optimized raw data
+                optimized_data = organoid_group['data'][:]
+                if hasattr(optimized_data, 'compute'):
+                    optimized_data = optimized_data.compute()
+                else:
+                    optimized_data = np.array(optimized_data)
+                
+                # Load z-optimized masks
+                optimized_masks = organoid_group['masks'][:]
+                if hasattr(optimized_masks, 'compute'):
+                    optimized_masks = optimized_masks.compute()
+                else:
+                    optimized_masks = np.array(optimized_masks)
+                
+                # Get metadata
+                metadata = dict(organoid_group.attrs)
+                optimized_shape = optimized_data.shape
+                compression_ratio = metadata.get('compression_ratio_percent', 0)
+                n_nuclei = metadata.get('n_nuclei', 0)
+                
+                print(f"✅ Z-optimized data loaded: {optimized_shape}")
+                print(f"✅ Z-optimized masks loaded: {optimized_masks.shape}")
+                print(f"📊 Compression: {compression_ratio:.1f}%")
+                print(f"🧬 Nuclei count: {n_nuclei}")
+            else:
+                print(f"❌ Organoid {organoid_key} not found in segmented data")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error loading optimized data: {e}")
+            return None
+    else:
+        print(f"❌ Segmented zarr not found: {segmented_zarr}")
+        return None
+    
+    # Calculate z-slice comparison
+    if original_shape and optimized_shape:
+        original_z = original_shape[1]
+        optimized_z = optimized_shape[1]
+        z_reduction = original_z - optimized_z
+        z_reduction_percent = (z_reduction / original_z) * 100
+        
+        print(f"\n📏 Z-SLICE COMPARISON:")
+        print(f"   → Original z-slices: {original_z}")
+        print(f"   → Optimized z-slices: {optimized_z}")
+        print(f"   → Slices removed: {z_reduction}")
+        print(f"   → Z-reduction: {z_reduction_percent:.1f}%")
+    
+    # Create napari viewer
+    print(f"\n🔍 Opening comparison in napari...")
+    viewer = napari.Viewer()
+    
+    # Get channel names
+    try:
+        if CONFIG_AVAILABLE:
+            from karyosight.config import CHANNELS
+            channel_names = CHANNELS
+        else:
+            channel_names = ['nucleus', 'tetraploid', 'diploid', 'sox9', 'sox2', 'brightfield']
+    except:
+        channel_names = ['DAPI', 'GFP', 'RFP', 'Cy5', 'Channel_4', 'Channel_5']
+    
+    # Add original raw data channels
+    if original_data.ndim == 4:  # [C, Z, Y, X]
+        for c in range(original_data.shape[0]):
+            channel_name = channel_names[c] if c < len(channel_names) else f'Channel_{c}'
+            viewer.add_image(
+                original_data[c],
+                name=f'ORIGINAL - {channel_name} ({original_z} z-slices)',
+                colormap='gray' if c == 0 else 'green' if c == 1 else 'red' if c == 2 else 'cyan',
+                visible=(c == 0),  # Only show DAPI initially
+                contrast_limits=[original_data[c].min(), np.percentile(original_data[c], 99)]
+            )
+    
+    # Add z-optimized raw data channels
+    if optimized_data.ndim == 4:  # [C, Z, Y, X]
+        for c in range(optimized_data.shape[0]):
+            channel_name = channel_names[c] if c < len(channel_names) else f'Channel_{c}'
+            viewer.add_image(
+                optimized_data[c],
+                name=f'Z-OPTIMIZED - {channel_name} ({optimized_z} z-slices)',
+                colormap='gray' if c == 0 else 'green' if c == 1 else 'red' if c == 2 else 'cyan',
+                visible=False,  # Start hidden for comparison
+                contrast_limits=[optimized_data[c].min(), np.percentile(optimized_data[c], 99)]
+            )
+    
+    # Add z-optimized masks
+    if optimized_masks is not None:
+        viewer.add_labels(
+            optimized_masks,
+            name=f'Z-Optimized Masks ({n_nuclei} nuclei)',
+            opacity=0.7,
+            visible=False  # Start hidden
+        )
+    
+    print(f"✅ Comparison viewer opened!")
+    print(f"\n💡 COMPARISON TIPS:")
+    print(f"   • Toggle between 'ORIGINAL' and 'Z-OPTIMIZED' layers")
+    print(f"   • Notice the different z-slice counts in layer names")
+    print(f"   • Original: {original_z} slices → Optimized: {optimized_z} slices")
+    print(f"   • File size reduction: {compression_ratio:.1f}%")
+    print(f"   • All nuclei preserved in optimized version")
+    print(f"   • Use layer visibility toggles to compare")
+    
+    return viewer
+
+def quick_compare_raw_vs_optimized(
+    condition_name: Optional[str] = None,
+    organoid_idx: int = 0
+):
+    """
+    Quick function to compare raw vs optimized data
+    
+    Args:
+        condition_name: Condition to compare (first available if None)
+        organoid_idx: Organoid index to compare
+        
+    Returns:
+        napari.Viewer instance or None
+    """
+    return compare_raw_vs_optimized(condition_name, organoid_idx)
+
+# ======================================================================================
+# SEGMENTED ORGANOID VISUALIZATION
+# ======================================================================================
+
+class SegmentedOrganoidVisualizer:
+    """
+    A class for visualizing segmented organoids from the new segmented directory structure.
+    Creates grid layouts of max projections with segmentation mask overlays.
+    """
+    
+    def __init__(self, segmented_dir: Optional[Path] = None):
+        """
+        Initialize the visualizer with the segmented data directory.
+        
+        Args:
+            segmented_dir: Path to the segmented directory (uses config default if None)
+        """
+        if segmented_dir is None:
+            try:
+                from karyosight.config import SEGMENTED_DIR
+                self.segmented_dir = Path(SEGMENTED_DIR)
+            except:
+                self.segmented_dir = Path("D:/LB_TEST/segmented")
+        else:
+            self.segmented_dir = Path(segmented_dir)
+        
+        # Create visualization subdirectory
+        self.vis_dir = self.segmented_dir / "visualization"
+        self.vis_dir.mkdir(exist_ok=True)
+        
+        print(f"📊 SegmentedOrganoidVisualizer initialized")
+        print(f"   → Segmented dir: {self.segmented_dir}")
+        print(f"   → Visualization dir: {self.vis_dir}")
+    
+    def count_organoids_per_condition(self) -> Dict[str, int]:
+        """
+        Count the number of organoids in each condition's segmented zarr file.
+        
+        Returns:
+            Dictionary mapping condition names to organoid counts
+        """
+        counts = {}
+        
+        # Find all segmented zarr files
+        segmented_zarrs = list(self.segmented_dir.rglob("*_segmented.zarr"))
+        
+        for zarr_path in segmented_zarrs:
+            condition = zarr_path.parent.name
+            
+            try:
+                bundle = zarr.open_group(str(zarr_path), mode='r')
+                organoid_keys = [k for k in bundle.keys() if k.startswith('organoid_')]
+                n_organoids = len(organoid_keys)
+                counts[condition] = n_organoids
+                
+            except Exception as e:
+                print(f"Warning: Could not read {zarr_path}: {e}")
+                counts[condition] = 0
+        
+        return counts
+    
+    def _load_segmented_data(self, 
+                            zarr_path: Path, 
+                            channel: int = 0,
+                            sample_count: Optional[int] = None) -> Tuple[List[np.ndarray], List[np.ndarray], List[int]]:
+        """
+        Load segmented organoid data (raw data + masks) from a zarr file.
+        
+        Args:
+            zarr_path: Path to the segmented zarr file
+            channel: Channel index to load for raw data
+            sample_count: Number of organoids to sample (None for all)
+            
+        Returns:
+            Tuple of (max_projections, mask_projections, indices)
+        """
+        bundle = zarr.open_group(str(zarr_path), mode='r')
+        
+        # Get all organoid keys
+        organoid_keys = sorted([k for k in bundle.keys() if k.startswith('organoid_')])
+        total_organoids = len(organoid_keys)
+        
+        # Determine which organoids to load
+        if sample_count is None or sample_count >= total_organoids:
+            indices = list(range(total_organoids))
+            selected_keys = organoid_keys
+        else:
+            # Randomly sample organoids
+            indices = np.random.choice(total_organoids, sample_count, replace=False).tolist()
+            indices.sort()
+            selected_keys = [organoid_keys[i] for i in indices]
+        
+        # Load data for selected organoids
+        max_projections = []
+        mask_projections = []
+        
+        for key in selected_keys:
+            organoid_group = bundle[key]
+            
+            # Load z-optimized raw data
+            raw_data = organoid_group['data'][:]
+            if hasattr(raw_data, 'compute'):
+                raw_data = raw_data.compute()
+            else:
+                raw_data = np.array(raw_data)
+            
+            # Load z-optimized masks
+            masks = organoid_group['masks'][:]
+            if hasattr(masks, 'compute'):
+                masks = masks.compute()
+            else:
+                masks = np.array(masks)
+            
+            # Create max projections
+            if raw_data.ndim == 4:  # [C, Z, Y, X]
+                raw_max_proj = np.max(raw_data[channel], axis=0)  # Max along Z
+            else:  # [Z, Y, X] - single channel
+                raw_max_proj = np.max(raw_data, axis=0)
+            
+            # Create mask max projection (any nuclei present across z)
+            mask_max_proj = np.max(masks, axis=0)
+            
+            max_projections.append(raw_max_proj)
+            mask_projections.append(mask_max_proj)
+        
+        return max_projections, mask_projections, indices
+    
+    def _calculate_grid_size(self, n_items: int) -> Tuple[int, int]:
+        """Calculate optimal grid size for displaying n_items."""
+        if n_items == 1:
+            return 1, 1
+        
+        # Try to make a roughly square grid
+        cols = int(np.ceil(np.sqrt(n_items)))
+        rows = int(np.ceil(n_items / cols))
+        return rows, cols
+    
+    def create_segmented_organoid_grid(self,
+                                      condition: str,
+                                      channel: int = 0,
+                                      sample_count: Optional[int] = None,
+                                      mask_overlay: bool = True,
+                                      mask_alpha: float = 0.3,
+                                      auto_scale_method: str = 'individual',
+                                      figsize_per_organoid: Tuple[float, float] = (3, 3),
+                                      save_svg: bool = True,
+                                      save_png: bool = False,
+                                      show_plot: bool = True) -> Optional[Path]:
+        """
+        Create a grid visualization of segmented organoids with mask overlays.
+        
+        Args:
+            condition: Name of the condition to visualize
+            channel: Channel to visualize for raw data
+            sample_count: Number of organoids to sample (None for all)
+            mask_overlay: Whether to overlay segmentation masks
+            mask_alpha: Transparency of mask overlay (0-1)
+            auto_scale_method: 'individual' or 'global' scaling
+            figsize_per_organoid: Size of each subplot in inches
+            save_svg: Whether to save as SVG (vector format)
+            save_png: Whether to save as PNG (raster format)
+            show_plot: Whether to display the plot
+            
+        Returns:
+            Path to saved file if save_svg/save_png=True, else None
+        """
+        # Find the segmented zarr file for this condition
+        zarr_path = self.segmented_dir / condition / f"{condition}_segmented.zarr"
+        
+        if not zarr_path.exists():
+            print(f"Warning: No segmented zarr found for condition {condition}")
+            print(f"Expected path: {zarr_path}")
+            return None
+        
+        # Load segmented data
+        projections, mask_projections, indices = self._load_segmented_data(
+            zarr_path, channel=channel, sample_count=sample_count
+        )
+        
+        if len(projections) == 0:
+            print(f"No organoids found for condition {condition}")
+            return None
+        
+        # Calculate grid layout
+        rows, cols = self._calculate_grid_size(len(projections))
+        
+        # Calculate figure size
+        fig_width = cols * figsize_per_organoid[0]
+        fig_height = rows * figsize_per_organoid[1]
+        
+        # Compute scaling
+        vmin_vals = []
+        vmax_vals = []
+        
+        if auto_scale_method == 'individual':
+            for proj in projections:
+                vmin = np.percentile(proj[proj > 0], 1) if np.any(proj > 0) else 0
+                vmax = np.percentile(proj, 99.5)
+                vmin_vals.append(vmin)
+                vmax_vals.append(vmax)
+        else:  # global
+            all_nonzero = np.concatenate([p[p > 0] for p in projections if np.any(p > 0)])
+            if len(all_nonzero) > 0:
+                global_vmin = np.percentile(all_nonzero, 1)
+                global_vmax = np.percentile(np.concatenate([p.flatten() for p in projections]), 99.5)
+            else:
+                global_vmin = 0
+                global_vmax = max(p.max() for p in projections)
+            
+            vmin_vals = [global_vmin] * len(projections)
+            vmax_vals = [global_vmax] * len(projections)
+        
+        # Create the figure
+        fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height))
+        if rows * cols == 1:
+            axes = [axes]
+        else:
+            axes = axes.flatten() if rows > 1 or cols > 1 else [axes]
+        
+        # Plot each organoid
+        for i, (proj, mask_proj, idx) in enumerate(zip(projections, mask_projections, indices)):
+            ax = axes[i]
+            
+            vmin, vmax = vmin_vals[i], vmax_vals[i]
+            
+            # Show raw data
+            ax.imshow(proj, cmap='gray', vmin=vmin, vmax=vmax)
+            
+            # Overlay masks if requested
+            if mask_overlay and np.any(mask_proj > 0):
+                # Create colored mask overlay
+                mask_colored = np.zeros((*mask_proj.shape, 4))  # RGBA
+                mask_colored[..., 0] = 1.0  # Red channel
+                mask_colored[..., 3] = (mask_proj > 0).astype(float) * mask_alpha  # Alpha
+                ax.imshow(mask_colored)
+            
+            # Get nuclei count from mask
+            n_nuclei = len(np.unique(mask_proj)) - 1  # Exclude background
+            
+            title = f'Organoid {idx}'
+            if mask_overlay:
+                title += f' ({n_nuclei} nuclei)'
+            
+            ax.set_title(title, fontsize=10)
+            ax.axis('off')
+        
+        # Hide unused subplots
+        for i in range(len(projections), len(axes)):
+            axes[i].axis('off')
+        
+        # Set overall title
+        try:
+            if CONFIG_AVAILABLE:
+                from karyosight.config import CHANNELS
+                channel_names = CHANNELS
+                channel_name = channel_names[channel] if channel < len(channel_names) else f'Channel_{channel}'
+            else:
+                channel_name = f'Channel_{channel}'
+        except:
+            channel_name = f'Channel_{channel}'
+        
+        title = f"{condition} - {channel_name} (Z-Optimized)"
+        if mask_overlay:
+            title += " + Segmentation Masks"
+        if sample_count is not None:
+            title += f" - {len(projections)} sampled"
+        else:
+            title += f" - All {len(projections)} organoids"
+        
+        fig.suptitle(title, fontsize=16, y=0.98)
+        plt.tight_layout()
+        
+        # Save if requested
+        saved_path = None
+        if save_svg or save_png:
+            # Create filename
+            filename = f"{condition}_{channel_name}"
+            if mask_overlay:
+                filename += "_with_masks"
+            if sample_count is not None:
+                filename += f"_n{len(projections)}"
+            filename += f"_{auto_scale_method}"
+            
+            if save_svg:
+                svg_path = self.vis_dir / f"{filename}.svg"
+                plt.savefig(svg_path, format='svg', bbox_inches='tight', dpi=300)
+                print(f"💾 Saved SVG: {svg_path}")
+                saved_path = svg_path
+            
+            if save_png:
+                png_path = self.vis_dir / f"{filename}.png"
+                plt.savefig(png_path, format='png', dpi=150, bbox_inches='tight')
+                print(f"💾 Saved PNG: {png_path}")
+                if not save_svg:  # Only set as saved_path if SVG wasn't saved
+                    saved_path = png_path
+        
+        if show_plot:
+            plt.show()
+        else:
+            plt.close()
+        
+        return saved_path
+    
+    def create_all_conditions_grid(self,
+                                  channel: int = 0,
+                                  sample_count: Optional[int] = 12,
+                                  mask_overlay: bool = True,
+                                  mask_alpha: float = 0.3,
+                                  auto_scale_method: str = 'individual',
+                                  save_svg: bool = True,
+                                  save_png: bool = False,
+                                  show_plot: bool = True) -> List[Path]:
+        """
+        Create grid visualizations for all segmented conditions.
+        
+        Args:
+            channel: Channel to visualize
+            sample_count: Number of organoids to sample per condition
+            mask_overlay: Whether to overlay segmentation masks
+            mask_alpha: Transparency of mask overlay
+            auto_scale_method: Scaling method ('individual' or 'global')
+            save_svg: Whether to save as SVG
+            save_png: Whether to save as PNG
+            show_plot: Whether to display plots
+            
+        Returns:
+            List of paths to saved files
+        """
+        saved_paths = []
+        
+        # Find all segmented conditions
+        segmented_zarrs = list(self.segmented_dir.rglob("*_segmented.zarr"))
+        conditions = [zarr.parent.name for zarr in segmented_zarrs]
+        
+        print(f"🎨 Creating visualizations for {len(conditions)} conditions...")
+        
+        for condition in sorted(conditions):
+            print(f"\n📊 Visualizing {condition}...")
+            saved_path = self.create_segmented_organoid_grid(
+                condition=condition,
+                channel=channel,
+                sample_count=sample_count,
+                mask_overlay=mask_overlay,
+                mask_alpha=mask_alpha,
+                auto_scale_method=auto_scale_method,
+                save_svg=save_svg,
+                save_png=save_png,
+                show_plot=show_plot
+            )
+            if saved_path:
+                saved_paths.append(saved_path)
+        
+        print(f"\n✅ Visualization complete! Saved {len(saved_paths)} files to:")
+        print(f"   → {self.vis_dir}")
+        
+        return saved_paths
+    
+    def create_channel_comparison(self,
+                                 condition: str,
+                                 organoid_idx: int = 0,
+                                 channels: Optional[List[int]] = None,
+                                 mask_overlay: bool = True,
+                                 mask_alpha: float = 0.3,
+                                 auto_scale_method: str = 'individual',
+                                 save_svg: bool = True,
+                                 save_png: bool = False,
+                                 show_plot: bool = True) -> Optional[Path]:
+        """
+        Create a comparison showing the same organoid across different channels.
+        
+        Args:
+            condition: Condition name
+            organoid_idx: Index of organoid to show
+            channels: List of channels to show (default: [0, 1, 2])
+            mask_overlay: Whether to overlay segmentation masks
+            mask_alpha: Transparency of mask overlay
+            auto_scale_method: Scaling method
+            save_svg: Whether to save as SVG
+            save_png: Whether to save as PNG
+            show_plot: Whether to display the plot
+            
+        Returns:
+            Path to saved file if save_svg/save_png=True, else None
+        """
+        if channels is None:
+            channels = [0, 1, 2]  # Default to first 3 channels
+        
+        # Find the segmented zarr file
+        zarr_path = self.segmented_dir / condition / f"{condition}_segmented.zarr"
+        
+        if not zarr_path.exists():
+            print(f"Warning: No segmented zarr found for condition {condition}")
+            return None
+        
+        try:
+            bundle = zarr.open_group(str(zarr_path), mode='r')
+            organoid_key = f"organoid_{organoid_idx:04d}"
+            
+            if organoid_key not in bundle:
+                available_organoids = [k for k in bundle.keys() if k.startswith('organoid_')]
+                print(f"Warning: Organoid {organoid_idx} not found in {condition}")
+                print(f"Available organoids: {len(available_organoids)}")
+                return None
+            
+            organoid_group = bundle[organoid_key]
+            
+            # Load raw data and masks
+            raw_data = organoid_group['data'][:]
+            if hasattr(raw_data, 'compute'):
+                raw_data = raw_data.compute()
+            
+            masks = organoid_group['masks'][:]
+            if hasattr(masks, 'compute'):
+                masks = masks.compute()
+            
+            # Get metadata
+            metadata = dict(organoid_group.attrs)
+            n_nuclei = metadata.get('n_nuclei', len(np.unique(masks)) - 1)
+            compression = metadata.get('compression_ratio_percent', 0)
+            
+        except Exception as e:
+            print(f"Error loading data for {condition}, organoid {organoid_idx}: {e}")
+            return None
+        
+        # Create max projections for each channel
+        projections = []
+        for channel in channels:
+            if raw_data.ndim == 4 and channel < raw_data.shape[0]:  # [C, Z, Y, X]
+                proj = np.max(raw_data[channel], axis=0)
+                projections.append(proj)
+            elif raw_data.ndim == 3 and channel == 0:  # [Z, Y, X] - single channel
+                proj = np.max(raw_data, axis=0)
+                projections.append(proj)
+            else:
+                print(f"Warning: Channel {channel} not available")
+                channels.remove(channel)
+        
+        if not projections:
+            print("No valid channels found")
+            return None
+        
+        # Create mask projection
+        mask_proj = np.max(masks, axis=0)
+        
+        # Create figure
+        n_channels = len(projections)
+        fig, axes = plt.subplots(1, n_channels, figsize=(4 * n_channels, 4))
+        if n_channels == 1:
+            axes = [axes]
+        
+        # Plot each channel
+        for i, (proj, channel) in enumerate(zip(projections, channels)):
+            ax = axes[i]
+            
+            # Compute scaling
+            if auto_scale_method == 'individual':
+                vmin = np.percentile(proj[proj > 0], 1) if np.any(proj > 0) else 0
+                vmax = np.percentile(proj, 99.5)
+            else:  # global across all channels
+                all_nonzero = np.concatenate([p[p > 0] for p in projections if np.any(p > 0)])
+                if len(all_nonzero) > 0:
+                    vmin = np.percentile(all_nonzero, 1)
+                    vmax = np.percentile(np.concatenate([p.flatten() for p in projections]), 99.5)
+                else:
+                    vmin = 0
+                    vmax = max(p.max() for p in projections)
+            
+            # Show raw data
+            ax.imshow(proj, cmap='gray', vmin=vmin, vmax=vmax)
+            
+            # Overlay masks if requested
+            if mask_overlay and np.any(mask_proj > 0):
+                mask_colored = np.zeros((*mask_proj.shape, 4))  # RGBA
+                mask_colored[..., 0] = 1.0  # Red
+                mask_colored[..., 3] = (mask_proj > 0).astype(float) * mask_alpha
+                ax.imshow(mask_colored)
+            
+            # Get channel name
+            try:
+                if CONFIG_AVAILABLE:
+                    from karyosight.config import CHANNELS
+                    channel_names = CHANNELS
+                    channel_name = channel_names[channel] if channel < len(channel_names) else f'Channel_{channel}'
+                else:
+                    channel_name = f'Channel_{channel}'
+            except:
+                channel_name = f'Channel_{channel}'
+            
+            ax.set_title(channel_name, fontsize=12)
+            ax.axis('off')
+        
+        # Set overall title
+        title = f"{condition} - Organoid {organoid_idx}"
+        if mask_overlay:
+            title += f" ({n_nuclei} nuclei, {compression:.1f}% compression)"
+        
+        fig.suptitle(title, fontsize=14, y=0.95)
+        plt.tight_layout()
+        
+        # Save if requested
+        saved_path = None
+        if save_svg or save_png:
+            filename = f"{condition}_organoid{organoid_idx}_channels"
+            if mask_overlay:
+                filename += "_with_masks"
+            
+            if save_svg:
+                svg_path = self.vis_dir / f"{filename}.svg"
+                plt.savefig(svg_path, format='svg', bbox_inches='tight', dpi=300)
+                print(f"💾 Saved SVG: {svg_path}")
+                saved_path = svg_path
+            
+            if save_png:
+                png_path = self.vis_dir / f"{filename}.png"
+                plt.savefig(png_path, format='png', dpi=150, bbox_inches='tight')
+                print(f"💾 Saved PNG: {png_path}")
+                if not save_svg:
+                    saved_path = png_path
+        
+        if show_plot:
+            plt.show()
+        else:
+            plt.close()
+        
+        return saved_path
 
 if __name__ == "__main__":
     # Test installation when run directly

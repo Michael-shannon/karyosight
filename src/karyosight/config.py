@@ -5,9 +5,9 @@ from pathlib import Path
 # MASTER = Path(r"D:\LUNGBUD_MultiGridTest")  # master directory
 # MASTER = Path(r"D:\Lungbud_testsetmaster")  # master directory
 # MASTER = Path(r"O:\mshannon\2025\May\Lungbud_MASTER")  # master directory
-# MASTER = Path(r"D:\LUNGBUD_master")
+MASTER = Path(r"D:\LUNGBUD_master")
 # MASTER = Path(r"O:\mshannon\2025\May\LUNGBUD_master2")
-MASTER = Path(r"D:\LB_TEST2")
+# MASTER = Path(r"D:\LB_TEST3")
 # MASTER = Path(r"D:\LUNGBUD_OIRTEST")  # master directory
 
 # RAW_DIR         = Path(r"D:\LUNGBUDMASTERTEST_3") / "analyze"
@@ -17,6 +17,7 @@ MASTER = Path(r"D:\LB_TEST2")
 RAW_DIR         = MASTER / "analyze"
 STITCHED_DIR    = MASTER / "stitched"
 CROPPED_DIR = MASTER / "cropped"
+SEGMENTED_DIR = MASTER / "segmented"
 
 
 CONDITION_PREF  = "Condition_"
@@ -122,6 +123,11 @@ ENABLE_FOCUS_FILTERING = True          # whether to filter out-of-focus organoid
 FOCUS_DETECTION_METHOD = 'variance'    # method: 'variance', 'gradient', 'laplacian'
 FOCUS_THRESHOLD = 0.5                  # threshold for focus detection (will be optimized)
 MIN_FOCUS_SCORE = 100.0                # minimum focus score to keep organoid
+
+# Post-Segmentation Z-Slice Optimization Settings
+ENABLE_Z_SLICE_OPTIMIZATION = True     # optimize z-slices after segmentation
+Z_OPTIMIZATION_STRATEGY = 'z_range'    # strategy: 'covered_only', 'z_range', 'padded_range'
+Z_OPTIMIZATION_PADDING = 2             # padding slices around nuclei-containing region (for 'padded_range')
 
 # Validation and Testing
 VALIDATION_ORGANOID_IDX = 0            # organoid index for parameter testing
